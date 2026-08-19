@@ -3,15 +3,12 @@
  *
  * Each CUDA thread runs an independent contract instance with:
  *   - Private stack, frame, globals, linear memory, data-live flags
- *   - Private GPU-side K/V storage (simulates Soroban ledger)
+ *   - Private GPU-side object heap (GpuObjHeap) for Soroban Val objects
+ *   - Private GPU-side K/V ledger storage (GpuStorage)
  *   - GPU-side host function dispatch (no host boundary crossing)
  *
- * Host functions like has/get/put_contract_data are handled entirely
- * on the GPU using a per-thread GpuStorage struct, so each thread
- * has its own independent, mutable state — just like a real execution.
- *
  * CUDA events measure kernel time only (excluding H2D/D2H transfers).
- * TPS = N_threads / kernel_seconds.
+ * TPS = N_completed / kernel_seconds.
  */
 
 #include "cuwasm/host.h"
@@ -32,32 +29,32 @@ static constexpr uint32_t BENCH_FRAME_CAP  = 64;
 static constexpr uint64_t BENCH_MAX_STEPS  = 100000000ULL;
 
 // Kernel: one thread = one independent contract instance.
-// Host calls are handled in-kernel via gpu_host_dispatch.
+// Host calls handled on-GPU via gpu_host_dispatch (object heap + ledger storage).
 __global__ void k_batch(
     DevModule        mod,
     VmState*         states,
-    uint64_t*        stacks,     // [n_threads * BENCH_STACK_CAP]
-    Frame*           frames_arr, // [n_threads * BENCH_FRAME_CAP]
-    uint64_t*        globals,    // [n_threads * n_globals]
+    uint64_t*        stacks,      // [n_threads * BENCH_STACK_CAP]
+    Frame*           frames_arr,  // [n_threads * BENCH_FRAME_CAP]
+    uint64_t*        globals,     // [n_threads * n_globals]
     uint32_t         n_globals,
-    uint8_t*         memories,   // [n_threads * mem_max]
+    uint8_t*         memories,    // [n_threads * mem_max]
     uint32_t         mem_max,
     const uint8_t*   data_blob,
     uint32_t         data_blob_len,
     const uint32_t*  data_off,
     const uint32_t*  data_len,
-    uint8_t*         data_lives, // [n_threads * n_data]
+    uint8_t*         data_lives,  // [n_threads * n_data]
     uint32_t         n_data,
-    GpuStorage*      storages,   // [n_threads]
+    GpuHostState*    host_states, // [n_threads] — object heap + ledger storage
     uint64_t         max_steps)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     VmState&  st       = states[tid];
-    uint64_t* th_stack = stacks    + (uint64_t)tid * BENCH_STACK_CAP;
+    uint64_t* th_stack = stacks     + (uint64_t)tid * BENCH_STACK_CAP;
     Frame*    th_frame = frames_arr + (uint64_t)tid * BENCH_FRAME_CAP;
-    uint64_t* th_glob  = globals   + (uint64_t)tid * (n_globals ? n_globals : 1u);
-    uint8_t*  th_mem   = memories  + (uint64_t)tid * (mem_max ? mem_max : 1u);
+    uint64_t* th_glob  = globals    + (uint64_t)tid * (n_globals ? n_globals : 1u);
+    uint8_t*  th_mem   = memories   + (uint64_t)tid * (mem_max ? mem_max : 1u);
     uint8_t*  th_live  = data_lives + (uint64_t)tid * (n_data ? n_data : 1u);
 
     AoSView      sv{ th_stack, BENCH_STACK_CAP, 0 };
@@ -66,19 +63,20 @@ __global__ void k_batch(
     DataView     dv{ const_cast<uint8_t*>(data_blob), data_blob_len,
                      data_off, data_len, th_live, n_data };
 
-    GpuStorage& store = storages[tid];
+    GpuHostState& hstate = host_states[tid];
 
     HostMailbox mb{};
     for (;;) {
         run_instance(mod, st, sv, fv, th_glob, n_globals, mv, dv, &mb, max_steps);
         if (st.status != ST_HOSTCALL_PENDING)
             break;
-        // Dispatch host call on-GPU
-        if (!gpu_host_dispatch(store, mb)) {
+        // Dispatch host call on-GPU, passing thread's WASM linear memory
+        // so string/vec constructors can read data from it.
+        if (!gpu_host_dispatch(hstate, mb, th_mem, st.mem_size)) {
             st.status = ST_UNSUPPORTED_OP;
             break;
         }
-        // Push results onto thread's stack
+        // Push return values onto the thread's stack
         uint32_t sp = st.sp;
         for (uint16_t i = 0; i < mb.n_results && sp < BENCH_STACK_CAP; ++i)
             th_stack[sp++] = mb.results[i];
@@ -136,7 +134,7 @@ int main(int argc, char** argv) {
 
     // ── GPU setup ────────────────────────────────────────────────────────
     uint32_t n_globals = (uint32_t)hm.globals.size();
-    uint32_t mem_max   = hm.mem_size;  // actually-used memory only
+    uint32_t mem_max   = hm.mem_size;  // actually-used bytes
     uint32_t n_data    = (uint32_t)hm.data_live.size();
 
     // Pad call_args to match function signature
@@ -162,23 +160,23 @@ int main(int argc, char** argv) {
     h_frame_tmpl[0] = cuwasm::Frame{0, 0, 0, func.n_results};
 
     // ── Device allocations ───────────────────────────────────────────────
-    cuwasm::CuOp*     d_code  = nullptr;
-    uint64_t*  d_consts       = nullptr;
-    cuwasm::FuncMeta* d_funcs = nullptr;
-    const uint8_t* d_blob     = nullptr;
-    const uint32_t* d_doff    = nullptr;
-    const uint32_t* d_dlen    = nullptr;
-    uint32_t* d_table = nullptr;
-    uint32_t* d_tidx  = nullptr;
-    uint64_t* d_tfp   = nullptr;
+    cuwasm::CuOp*     d_code   = nullptr;
+    uint64_t*  d_consts        = nullptr;
+    cuwasm::FuncMeta* d_funcs  = nullptr;
+    const uint8_t*  d_blob     = nullptr;
+    const uint32_t* d_doff     = nullptr;
+    const uint32_t* d_dlen     = nullptr;
+    uint32_t* d_table  = nullptr;
+    uint32_t* d_tidx   = nullptr;
+    uint64_t* d_tfp    = nullptr;
 
-    cuwasm::VmState*    d_states   = nullptr;
-    uint64_t*           d_stacks   = nullptr;
-    cuwasm::Frame*      d_frames   = nullptr;
-    uint64_t*           d_globals  = nullptr;
-    uint8_t*            d_mems     = nullptr;
-    uint8_t*            d_lives    = nullptr;
-    cuwasm::GpuStorage* d_storages = nullptr;
+    cuwasm::VmState*       d_states     = nullptr;
+    uint64_t*              d_stacks     = nullptr;
+    cuwasm::Frame*         d_frames     = nullptr;
+    uint64_t*              d_globals    = nullptr;
+    uint8_t*               d_mems       = nullptr;
+    uint8_t*               d_lives      = nullptr;
+    cuwasm::GpuHostState*  d_host_states = nullptr;
 
     size_t code_bytes   = hm.code.size() * sizeof(cuwasm::CuOp);
     size_t consts_bytes = (hm.consts.empty() ? 1 : hm.consts.size()) * 8;
@@ -190,26 +188,26 @@ int main(int argc, char** argv) {
     size_t tidx_bytes   = (hm.func_typeidx.empty() ? 1 : hm.func_typeidx.size()) * 4;
     size_t tfp_bytes    = (hm.type_fp.empty() ? 1 : hm.type_fp.size()) * 8;
 
-    size_t per_states   = (size_t)n_threads * sizeof(cuwasm::VmState);
-    size_t per_stacks   = (size_t)n_threads * cuwasm::BENCH_STACK_CAP * 8;
-    size_t per_frames   = (size_t)n_threads * cuwasm::BENCH_FRAME_CAP * sizeof(cuwasm::Frame);
-    size_t per_globs    = (size_t)n_threads * (n_globals ? n_globals : 1u) * 8;
-    size_t per_mems     = (size_t)n_threads * (mem_max ? mem_max : 1u);
-    size_t per_lives    = (size_t)n_threads * (n_data ? n_data : 1u);
-    size_t per_storages = (size_t)n_threads * sizeof(cuwasm::GpuStorage);
+    size_t per_states    = (size_t)n_threads * sizeof(cuwasm::VmState);
+    size_t per_stacks    = (size_t)n_threads * cuwasm::BENCH_STACK_CAP * 8;
+    size_t per_frames    = (size_t)n_threads * cuwasm::BENCH_FRAME_CAP * sizeof(cuwasm::Frame);
+    size_t per_globs     = (size_t)n_threads * (n_globals ? n_globals : 1u) * 8;
+    size_t per_mems      = (size_t)n_threads * (mem_max ? mem_max : 1u);
+    size_t per_lives     = (size_t)n_threads * (n_data ? n_data : 1u);
+    size_t per_hstates   = (size_t)n_threads * sizeof(cuwasm::GpuHostState);
 
-    size_t total_bytes  = code_bytes + consts_bytes + funcs_bytes +
-                          per_states + per_stacks + per_frames + per_globs +
-                          per_mems + per_lives + per_storages;
+    size_t total_bytes   = code_bytes + consts_bytes + funcs_bytes +
+                           per_states + per_stacks + per_frames + per_globs +
+                           per_mems + per_lives + per_hstates;
     std::fprintf(stderr, "bench: %d threads, %zu MB device memory\n",
                  n_threads, total_bytes / (1024*1024));
-    std::fprintf(stderr, "  per-thread breakdown: stack=%zuB frames=%zuB globals=%zuB "
-                 "mem=%uB storage=%zuB\n",
+    std::fprintf(stderr, "  per-thread: stack=%zuB frames=%zuB globals=%zuB "
+                 "mem=%uB host_state=%zuB\n",
                  cuwasm::BENCH_STACK_CAP * 8,
                  cuwasm::BENCH_FRAME_CAP * sizeof(cuwasm::Frame),
                  (size_t)(n_globals ? n_globals : 1u) * 8,
                  mem_max ? mem_max : 1u,
-                 sizeof(cuwasm::GpuStorage));
+                 sizeof(cuwasm::GpuHostState));
 
     CU(cudaMalloc(&d_code,   code_bytes));
     CU(cudaMalloc(&d_consts, consts_bytes));
@@ -220,15 +218,15 @@ int main(int argc, char** argv) {
     CU(cudaMalloc((void**)&d_table, table_bytes));
     CU(cudaMalloc((void**)&d_tidx, tidx_bytes));
     CU(cudaMalloc((void**)&d_tfp, tfp_bytes));
-    CU(cudaMalloc(&d_states,   per_states));
-    CU(cudaMalloc(&d_stacks,   per_stacks));
-    CU(cudaMalloc(&d_frames,   per_frames));
-    CU(cudaMalloc(&d_globals,  per_globs));
-    CU(cudaMalloc(&d_mems,     per_mems ? per_mems : 1));
-    CU(cudaMalloc(&d_lives,    per_lives ? per_lives : 1));
-    CU(cudaMalloc(&d_storages, per_storages));
+    CU(cudaMalloc(&d_states,      per_states));
+    CU(cudaMalloc(&d_stacks,      per_stacks));
+    CU(cudaMalloc(&d_frames,      per_frames));
+    CU(cudaMalloc(&d_globals,     per_globs));
+    CU(cudaMalloc(&d_mems,        per_mems ? per_mems : 1));
+    CU(cudaMalloc(&d_lives,       per_lives ? per_lives : 1));
+    CU(cudaMalloc(&d_host_states, per_hstates));
 
-    // Upload read-only data (shared across threads)
+    // Upload read-only module data (shared across all threads)
     CU(cudaMemcpy(d_code, hm.code.data(), code_bytes, cudaMemcpyHostToDevice));
     if (!hm.consts.empty())
         CU(cudaMemcpy(d_consts, hm.consts.data(), hm.consts.size()*8, cudaMemcpyHostToDevice));
@@ -252,13 +250,13 @@ int main(int argc, char** argv) {
     dm.funcs    = d_funcs;
     dm.n_funcs  = (uint32_t)hm.funcs.size();
     dm.code_len = (uint32_t)hm.code.size();
-    dm.table    = hm.table.empty() ? nullptr : d_table;
+    dm.table    = hm.table.empty()    ? nullptr : d_table;
     dm.table_len= (uint32_t)hm.table.size();
     dm.func_typeidx = hm.func_typeidx.empty() ? nullptr : d_tidx;
     dm.type_fp  = hm.type_fp.empty() ? nullptr : d_tfp;
     dm.n_types  = (uint32_t)hm.type_fp.size();
 
-    // ── reinit: set up per-thread private state ──────────────────────────
+    // ── reinit: reset all per-thread mutable state ───────────────────────
     auto reinit = [&]() {
         {
             std::vector<cuwasm::VmState> h_st(n_threads, st0);
@@ -294,8 +292,8 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> h_l((size_t)n_threads * n_data, 1);
             cudaMemcpy(d_lives, h_l.data(), per_lives, cudaMemcpyHostToDevice);
         }
-        // Zero-init all per-thread storages (empty K/V stores)
-        cudaMemset(d_storages, 0, per_storages);
+        // Zero-init all per-thread host states (empty object heap + storage)
+        cudaMemset(d_host_states, 0, per_hstates);
     };
 
     auto launch = [&]() {
@@ -304,7 +302,7 @@ int main(int argc, char** argv) {
             d_mems, mem_max,
             d_blob, (uint32_t)hm.data_blob.size(), d_doff, d_dlen,
             d_lives, n_data,
-            d_storages,
+            d_host_states,
             cuwasm::BENCH_MAX_STEPS);
     };
 
@@ -313,7 +311,7 @@ int main(int argc, char** argv) {
     launch();
     CU(cudaDeviceSynchronize());
 
-    // Check warmup results + verify thread 0's return value
+    // Check results and print thread[0] diagnostics
     {
         std::vector<cuwasm::VmState> h_out(n_threads);
         cudaMemcpy(h_out.data(), d_states, per_states, cudaMemcpyDeviceToHost);
@@ -331,24 +329,25 @@ int main(int argc, char** argv) {
         if (other) std::fprintf(stderr, " (first=%s)", cuwasm::status_name(first_fail));
         std::fprintf(stderr, "\n");
 
-        // Read back thread 0 result and storage for verification
-        if (ok > 0 && func.n_results > 0) {
+        // Diagnostics for thread[0]
+        if (func.n_results > 0) {
             uint64_t result0 = 0;
             cudaMemcpy(&result0, d_stacks, sizeof(uint64_t), cudaMemcpyDeviceToHost);
             std::fprintf(stderr, "  thread[0] result = 0x%llx\n", (long long)result0);
         }
         {
-            cuwasm::GpuStorage h_store;
-            cudaMemcpy(&h_store, d_storages, sizeof(cuwasm::GpuStorage), cudaMemcpyDeviceToHost);
-            std::fprintf(stderr, "  thread[0] storage: %u entries\n", h_store.count);
-            for (uint32_t i = 0; i < h_store.count && i < 4; ++i)
-                std::fprintf(stderr, "    [%u] key=0x%llx val=0x%llx\n", i,
-                             (long long)h_store.entries[i].key,
-                             (long long)h_store.entries[i].val);
+            cuwasm::GpuHostState h_hstate;
+            cudaMemcpy(&h_hstate, d_host_states, sizeof(cuwasm::GpuHostState), cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "  thread[0] obj_heap: %u objects, storage: %u entries\n",
+                         h_hstate.obj_heap.count, h_hstate.storage.count);
+            for (uint32_t i = 0; i < h_hstate.storage.count && i < 4; ++i)
+                std::fprintf(stderr, "    storage[%u] key=0x%llx val=0x%llx\n", i,
+                             (long long)h_hstate.storage.entries[i].key,
+                             (long long)h_hstate.storage.entries[i].val);
         }
+
         if (ok == 0) {
-            std::fprintf(stderr, "ERROR: zero threads completed successfully; aborting.\n");
-            // Still print a result line with 0 TPS for scripting
+            std::fprintf(stderr, "ERROR: zero threads succeeded; aborting.\n");
             std::printf("{\"contract\":\"%s\",\"export\":\"%s\","
                         "\"n_threads\":%d,\"kernel_ms\":0,\"tps\":0,\"ok\":0}\n",
                         wasm_path, exp_name, n_threads);
@@ -370,7 +369,7 @@ int main(int argc, char** argv) {
     float ms = 0.f;
     CU(cudaEventElapsedTime(&ms, ev0, ev1));
 
-    // Count successes in timed run
+    // Count successes
     int n_ok = 0;
     {
         std::vector<cuwasm::VmState> h_out(n_threads);
@@ -380,12 +379,10 @@ int main(int argc, char** argv) {
     }
 
     double tps = (double)n_ok / (ms / 1000.0);
-
     std::printf(
         "{\"contract\":\"%s\",\"export\":\"%s\","
         "\"n_threads\":%d,\"blocks\":%d,\"block_size\":%d,"
-        "\"ok\":%d,"
-        "\"kernel_ms\":%.3f,\"tps\":%.0f}\n",
+        "\"ok\":%d,\"kernel_ms\":%.3f,\"tps\":%.0f}\n",
         wasm_path, exp_name, n_threads, n_blocks, block_size,
         n_ok, (double)ms, tps);
 
@@ -394,7 +391,7 @@ int main(int argc, char** argv) {
     cudaFree(d_globals); cudaFree(d_mems); cudaFree(d_lives);
     cudaFree((void*)d_blob); cudaFree((void*)d_doff); cudaFree((void*)d_dlen);
     cudaFree(d_table); cudaFree(d_tidx); cudaFree(d_tfp);
-    cudaFree(d_storages);
+    cudaFree(d_host_states);
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
     return 0;
