@@ -1,0 +1,230 @@
+file: /tmp/soroban-target/wasm32v1-none/release/soroban_hello_world_contract.wasm
+bytes: 574
+memory: min=17 max=None shared=false memory64=false
+funcs: 2  globals: 3  tables: 0  data: 1  elem: 0  start: false
+float_ops: 0  simd_ops: 0
+customs: ["contractspecv0", "contractenvmetav0", "contractmetav0"]
+imports (2):
+  b::i  Func(0)
+  v::g  Func(0)
+exports (5):
+  memory  Memory
+  hello  Func
+  _  Func
+  __data_end  Global
+  __heap_base  Global
+opcodes (26 unique, 95 total):
+      18  LocalGet
+      12  I32Const
+       9  I32Add
+       9  I64Const
+       7  End
+       6  LocalSet
+       4  I64Store
+       3  Block
+       3  BrIf
+       2  Br
+       2  Call
+       2  GlobalSet
+       2  I64ExtendI32U
+       2  I64Or
+       2  I64Shl
+       2  Loop
+       1  GlobalGet
+       1  I32Eq
+       1  I32Ne
+       1  I32Sub
+       1  I64And
+       1  I64Load
+       1  I64Ne
+       1  LocalTee
+       1  Return
+       1  Unreachable
+
+file: /tmp/soroban-target/wasm32v1-none/release/soroban_increment_contract.wasm
+bytes: 582
+memory: min=16 max=None shared=false memory64=false
+funcs: 5  globals: 3  tables: 0  data: 0  elem: 0  start: false
+float_ops: 0  simd_ops: 0
+customs: ["contractspecv0", "contractenvmetav0", "contractmetav0"]
+imports (4):
+  l::0  Func(0)
+  l::1  Func(0)
+  l::_  Func(1)
+  l::8  Func(0)
+exports (5):
+  memory  Memory
+  increment  Func
+  _  Func
+  __data_end  Global
+  __heap_base  Global
+opcodes (21 unique, 64 total):
+      12  I64Const
+       8  End
+       7  Call
+       6  LocalGet
+       4  LocalTee
+       4  Unreachable
+       3  Block
+       3  BrIf
+       2  Drop
+       2  I32Const
+       2  I64Ne
+       2  LocalSet
+       1  I32Add
+       1  I32Eqz
+       1  I32WrapI64
+       1  I64And
+       1  I64ExtendI32U
+       1  I64Or
+       1  I64Shl
+       1  I64ShrU
+       1  Return
+
+file: /tmp/soroban-target/wasm32v1-none/release/soroban_auth_contract.wasm
+bytes: 1013
+memory: min=17 max=None shared=false memory64=false
+funcs: 5  globals: 3  tables: 0  data: 1  elem: 0  start: false
+float_ops: 0  simd_ops: 0
+customs: ["contractspecv0", "contractenvmetav0", "contractmetav0"]
+imports (6):
+  b::j  Func(0)
+  v::g  Func(0)
+  a::0  Func(1)
+  l::0  Func(0)
+  l::1  Func(0)
+  l::_  Func(2)
+exports (5):
+  memory  Memory
+  increment  Func
+  _  Func
+  __data_end  Global
+  __heap_base  Global
+opcodes (32 unique, 214 total):
+      34  LocalGet
+      27  I64Const
+      21  I32Const
+      15  End
+      12  LocalSet
+      10  BrIf
+      10  Call
+      10  I32Add
+       9  Block
+       7  LocalTee
+       6  I64Or
+       6  I64Shl
+       5  I64ExtendI32U
+       4  Br
+       4  I64And
+       4  I64Ne
+       4  I64Store
+       4  Unreachable
+       3  I32And
+       3  I32LtU
+       2  Drop
+       2  GlobalSet
+       2  I32WrapI64
+       2  I64ShrU
+       1  GlobalGet
+       1  I32Eq
+       1  I32Eqz
+       1  I32GtU
+       1  I32Load8U
+       1  I32Sub
+       1  Loop
+       1  Return
+
+file: /tmp/soroban-target/wasm32v1-none/release/soroban_token_contract.wasm
+bytes: 7317
+memory: min=17 max=None shared=false memory64=false
+funcs: 49  globals: 3  tables: 0  data: 1  elem: 0  start: false
+float_ops: 0  simd_ops: 0
+customs: ["contractspecv0", "contractenvmetav0", "contractmetav0"]
+imports (15):
+  l::7  Func(0)
+  l::1  Func(1)
+  l::_  Func(2)
+  a::0  Func(3)
+  x::1  Func(1)
+  v::g  Func(1)
+  i::8  Func(3)
+  i::7  Func(3)
+  i::6  Func(1)
+  b::j  Func(1)
+  m::9  Func(2)
+  m::a  Func(0)
+  x::3  Func(4)
+  l::0  Func(1)
+  l::8  Func(1)
+exports (17):
+  memory  Memory
+  __constructor  Func
+  mint  Func
+  set_admin  Func
+  allowance  Func
+  approve  Func
+  balance  Func
+  transfer  Func
+  transfer_from  Func
+  burn  Func
+  burn_from  Func
+  decimals  Func
+  name  Func
+  symbol  Func
+  _  Func
+  __data_end  Global
+  __heap_base  Global
+opcodes (52 unique, 2082 total):
+     537  LocalGet
+     171  I32Const
+     171  I64Const
+     148  Call
+     119  End
+      81  BrIf
+      80  I32Add
+      74  I64Store
+      66  LocalSet
+      63  Block
+      61  LocalTee
+      60  GlobalSet
+      53  I64Load
+      35  Unreachable
+      32  I64And
+      31  I32Sub
+      30  GlobalGet
+      28  I64Ne
+      22  I32Load
+      20  Br
+      19  Drop
+      19  I32Eq
+      19  I64Or
+      18  I64ExtendI32U
+      18  I64Shl
+      15  Return
+       8  I32Eqz
+       7  I64Xor
+       7  Loop
+       6  I64Eq
+       6  I64Sub
+       5  I32WrapI64
+       5  Select
+       4  I32And
+       4  I32Ne
+       4  I32Store
+       4  I64Add
+       4  I64LtS
+       4  I64ShrU
+       3  I32LtU
+       3  I64Eqz
+       3  I64GtS
+       3  I64LtU
+       3  I64ShrS
+       2  I32GtU
+       1  BrTable
+       1  I32GeU
+       1  I32Load8U
+       1  I64GeS
+       1  I64GeU
+       1  I64GtU
+       1  I64Load32U
+
