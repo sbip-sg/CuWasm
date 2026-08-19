@@ -126,15 +126,13 @@ HELLO_WASM  := contracts/wasm/soroban_hello_world_contract.wasm
 INCREMENT_WASM := contracts/wasm/soroban_increment_contract.wasm
 TOKEN_WASM  := contracts/wasm/soroban_token_contract.wasm
 BENCH_N     ?= 8192
-BENCH_BS    ?= 256
+BENCH_BS    ?= 64
 
 bench: $(BUILD)/bench
-	@echo "=== hello hello ($(BENCH_N) threads) ==="
-	$(BUILD)/bench $(HELLO_WASM)     hello     $(BENCH_N) $(BENCH_BS)
-	@echo "=== increment increment ($(BENCH_N) threads) ==="
-	$(BUILD)/bench $(INCREMENT_WASM) increment $(BENCH_N) $(BENCH_BS)
-	@echo "=== token balance ($(BENCH_N) threads) ==="
-	$(BUILD)/bench $(TOKEN_WASM)     balance   $(BENCH_N) $(BENCH_BS)
+	@echo "=== increment scaling sweep ==="
+	@for n in 256 1024 4096 8192 16384; do \
+	  $(BUILD)/bench $(INCREMENT_WASM) increment $$n $(BENCH_BS); \
+	done
 
 clean:
 	rm -rf $(BUILD)
