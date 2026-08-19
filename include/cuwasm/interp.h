@@ -6,6 +6,26 @@
 
 namespace cuwasm {
 
+HD void mul_wide_u(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi) {
+    uint64_t a0 = (uint32_t)a, a1 = a >> 32;
+    uint64_t b0 = (uint32_t)b, b1 = b >> 32;
+    uint64_t p0 = a0 * b0;
+    uint64_t p1 = a0 * b1;
+    uint64_t p2 = a1 * b0;
+    uint64_t p3 = a1 * b1;
+    uint64_t c = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
+    lo = (p0 & 0xffffffffull) | (c << 32);
+    hi = p3 + (p1 >> 32) + (p2 >> 32) + (c >> 32);
+}
+
+HD void mul_wide_s(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi) {
+    mul_wide_u(a, b, lo, hi);
+    if ((int64_t)a < 0)
+        hi -= b;
+    if ((int64_t)b < 0)
+        hi -= a;
+}
+
 template <class StackV, class FrameV>
 HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames,
                      uint64_t* globals, uint32_t n_globals, uint64_t max_steps) {
@@ -338,6 +358,40 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
         case OP_I64_EXTEND_I32_U: {
             uint64_t a = CU_POP();
             CU_PUSH((uint64_t)(uint32_t)a);
+            break;
+        }
+        case OP_I64_MUL_WIDE_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            uint64_t lo, hi;
+            mul_wide_u(a, b, lo, hi);
+            CU_PUSH(lo);
+            CU_PUSH(hi);
+            break;
+        }
+        case OP_I64_MUL_WIDE_S: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            uint64_t lo, hi;
+            mul_wide_s(a, b, lo, hi);
+            CU_PUSH(lo);
+            CU_PUSH(hi);
+            break;
+        }
+        case OP_I64_ADD128: {
+            uint64_t rhs_hi = CU_POP(), rhs_lo = CU_POP(), lhs_hi = CU_POP(), lhs_lo = CU_POP();
+            uint64_t lo = lhs_lo + rhs_lo;
+            uint64_t c = (lo < lhs_lo) ? 1ull : 0ull;
+            uint64_t hi = lhs_hi + rhs_hi + c;
+            CU_PUSH(lo);
+            CU_PUSH(hi);
+            break;
+        }
+        case OP_I64_SUB128: {
+            uint64_t rhs_hi = CU_POP(), rhs_lo = CU_POP(), lhs_hi = CU_POP(), lhs_lo = CU_POP();
+            uint64_t lo = lhs_lo - rhs_lo;
+            uint64_t brw = (lhs_lo < rhs_lo) ? 1ull : 0ull;
+            uint64_t hi = lhs_hi - rhs_hi - brw;
+            CU_PUSH(lo);
+            CU_PUSH(hi);
             break;
         }
 

@@ -130,6 +130,18 @@ bool verify_cuop(HostModule& m, std::string& err) {
                     return fail(err, "unop underflow");
                 next_h = h;
                 break;
+            case OP_I64_MUL_WIDE_S:
+            case OP_I64_MUL_WIDE_U:
+                if (h < 2)
+                    return fail(err, "mul_wide underflow");
+                next_h = h;
+                break;
+            case OP_I64_ADD128:
+            case OP_I64_SUB128:
+                if (h < 4)
+                    return fail(err, "i64.xxx128 underflow");
+                next_h = h - 2;
+                break;
             case OP_DROP:
                 if (h < 1)
                     return fail(err, "drop underflow");

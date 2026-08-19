@@ -72,6 +72,10 @@ pub const OP_I64_EXTEND_I32_U: u16 = 62;
 pub const OP_GLOBAL_GET: u16 = 63;
 pub const OP_GLOBAL_SET: u16 = 64;
 pub const OP_UNWIND: u16 = 65;
+pub const OP_I64_MUL_WIDE_S: u16 = 66;
+pub const OP_I64_MUL_WIDE_U: u16 = 67;
+pub const OP_I64_ADD128: u16 = 68;
+pub const OP_I64_SUB128: u16 = 69;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -534,6 +538,22 @@ fn lower_operators(
             Operator::I64ExtendI32U => {
                 emit(code, OP_I64_EXTEND_I32_U, 0, 0);
                 consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64MulWideS => {
+                emit(code, OP_I64_MUL_WIDE_S, 0, 0);
+                consume(&mut h, dead, 2, 2)?;
+            }
+            Operator::I64MulWideU => {
+                emit(code, OP_I64_MUL_WIDE_U, 0, 0);
+                consume(&mut h, dead, 2, 2)?;
+            }
+            Operator::I64Add128 => {
+                emit(code, OP_I64_ADD128, 0, 0);
+                consume(&mut h, dead, 4, 2)?;
+            }
+            Operator::I64Sub128 => {
+                emit(code, OP_I64_SUB128, 0, 0);
+                consume(&mut h, dead, 4, 2)?;
             }
             Operator::GlobalGet { global_index } => {
                 emit(code, OP_GLOBAL_GET, 0, global_index);
