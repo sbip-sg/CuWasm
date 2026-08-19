@@ -22,6 +22,8 @@ struct TranslateOut {
     char** export_names;
     uint32_t* export_idxs;
     uint32_t n_exports;
+    uint64_t* globals;
+    uint32_t n_globals;
     char* err;
 };
 int cuwasm_translate_wasm(const uint8_t* data, size_t len, TranslateOut* out);
@@ -57,6 +59,8 @@ bool translate_wasm(const uint8_t* data, size_t len, HostModule& out, std::strin
     for (uint32_t i = 0; i < t.n_exports; ++i) {
         out.exports.emplace_back(t.export_names[i] ? t.export_names[i] : "", t.export_idxs[i]);
     }
+    if (t.n_globals && t.globals)
+        out.globals.assign(t.globals, t.globals + t.n_globals);
     cuwasm_translate_free(&t);
     return true;
 }

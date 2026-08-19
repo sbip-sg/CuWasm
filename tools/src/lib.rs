@@ -69,6 +69,8 @@ pub const OP_I64_SHR_S: u16 = 59;
 pub const OP_I64_SHR_U: u16 = 60;
 pub const OP_I64_EXTEND_I32_S: u16 = 61;
 pub const OP_I64_EXTEND_I32_U: u16 = 62;
+pub const OP_GLOBAL_GET: u16 = 63;
+pub const OP_GLOBAL_SET: u16 = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +102,8 @@ pub struct TranslateOut {
     pub export_names: *mut *mut c_char,
     pub export_idxs: *mut u32,
     pub n_exports: u32,
+    pub globals: *mut u64,
+    pub n_globals: u32,
     pub err: *mut c_char,
 }
 
@@ -115,6 +119,8 @@ impl Default for TranslateOut {
             export_names: ptr::null_mut(),
             export_idxs: ptr::null_mut(),
             n_exports: 0,
+            globals: ptr::null_mut(),
+            n_globals: 0,
             err: ptr::null_mut(),
         }
     }
@@ -126,6 +132,7 @@ pub struct HostModule {
     pub consts: Vec<u64>,
     pub funcs: Vec<FuncMetaC>,
     pub exports: Vec<(String, u32)>,
+    pub globals: Vec<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -359,6 +366,12 @@ fn lower_operators(
             Operator::I64ExtendI32U => {
                 emit(code, OP_I64_EXTEND_I32_U, 0, 0);
             }
+            Operator::GlobalGet { global_index } => {
+                emit(code, OP_GLOBAL_GET, 0, global_index);
+            }
+            Operator::GlobalSet { global_index } => {
+                emit(code, OP_GLOBAL_SET, 0, global_index);
+            }
             Operator::LocalGet { local_index } => {
                 emit(code, OP_LOCAL_GET, local_index as u16, 0);
             }
@@ -515,8 +528,8 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
     let mut code: Vec<CuOpC> = Vec::new();
     let mut consts: Vec<u64> = Vec::new();
     let mut funcs: Vec<FuncMetaC> = Vec::new();
+    let mut globals: Vec<u64> = Vec::new();
     let mut saw_memory = false;
-    let mut saw_global = false;
     let mut saw_import = false;
 
     for payload in parser.parse_all(bytes) {
@@ -551,7 +564,25 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                 }
             }
             Payload::MemorySection(_) => saw_memory = true,
-            Payload::GlobalSection(_) => saw_global = true,
+            Payload::GlobalSection(reader) => {
+                for g in reader {
+                    let g = g.map_err(|e| format!("global: {e}"))?;
+                    if g.ty.content_type != ValType::I32 && g.ty.content_type != ValType::I64 {
+                        return Err(format!("unsupported global type {:?}", g.ty.content_type));
+                    }
+                    let mut val: Option<u64> = None;
+                    for op in g.init_expr.get_operators_reader() {
+                        let op = op.map_err(|e| format!("global init: {e}"))?;
+                        match op {
+                            Operator::I32Const { value } => val = Some(value as u32 as u64),
+                            Operator::I64Const { value } => val = Some(value as u64),
+                            Operator::End => {}
+                            other => return Err(format!("unsupported global init {other:?}")),
+                        }
+                    }
+                    globals.push(val.ok_or_else(|| "empty global init".to_string())?);
+                }
+            }
             Payload::ExportSection(reader) => {
                 for ex in reader {
                     let ex = ex.map_err(|e| format!("export: {e}"))?;
@@ -622,19 +653,16 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
     if saw_memory {
         return Err("memory not supported in stage 1".into());
     }
-    if saw_global {
-        return Err("globals not supported in stage 1".into());
-    }
     if funcs.is_empty() {
         return Err("no functions".into());
     }
 
-    let _ = (saw_memory, saw_global);
     Ok(HostModule {
         code,
         consts,
         funcs,
         exports,
+        globals,
     })
 }
 
@@ -690,6 +718,7 @@ pub unsafe extern "C" fn cuwasm_translate_wasm(
             let (export_names, n_exports1) = vec_to_raw(names);
             let (export_idxs, n_exports2) = vec_to_raw(idxs);
             debug_assert_eq!(n_exports1, n_exports2);
+            let (globals, n_globals) = vec_to_raw(m.globals);
             (*out).code = code;
             (*out).n_code = n_code;
             (*out).consts = consts;
@@ -699,6 +728,8 @@ pub unsafe extern "C" fn cuwasm_translate_wasm(
             (*out).export_names = export_names;
             (*out).export_idxs = export_idxs;
             (*out).n_exports = n_exports1;
+            (*out).globals = globals;
+            (*out).n_globals = n_globals;
             0
         }
         Err(e) => {
@@ -730,6 +761,7 @@ pub unsafe extern "C" fn cuwasm_translate_free(out: *mut TranslateOut) {
         }
     }
     free_vec(o.export_idxs, o.n_exports);
+    free_vec(o.globals, o.n_globals);
     if !o.err.is_null() {
         let _ = CString::from_raw(o.err);
     }

@@ -166,7 +166,9 @@ RunResult run_cpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
 
     AoSView sv{stack.data(), STACK_CAP, 0};
     AoSFrameView fv{frames.data(), FRAME_CAP, 0};
-    run_instance(m.dev(), st, sv, fv, max_steps);
+    std::vector<uint64_t> globals = m.globals;
+    run_instance(m.dev(), st, sv, fv, globals.empty() ? nullptr : globals.data(),
+                 (uint32_t)globals.size(), max_steps);
 
     r.status = st.status;
     r.peak_csp = st.peak_csp;

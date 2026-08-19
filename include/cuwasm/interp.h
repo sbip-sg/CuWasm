@@ -8,7 +8,7 @@ namespace cuwasm {
 
 template <class StackV, class FrameV>
 HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames,
-                     uint64_t max_steps) {
+                     uint64_t* globals, uint32_t n_globals, uint64_t max_steps) {
     uint32_t pc = st.pc, sp = st.sp, fp = st.fp, csp = st.csp;
     int64_t fuel = st.fuel;
     uint32_t peak_csp = st.peak_csp;
@@ -340,6 +340,17 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
             CU_PUSH((uint64_t)(uint32_t)a);
             break;
         }
+
+        case OP_GLOBAL_GET:
+            if (in.b >= n_globals || !globals)
+                TRAP(ST_UNSUPPORTED_OP);
+            CU_PUSH(globals[in.b]);
+            break;
+        case OP_GLOBAL_SET:
+            if (in.b >= n_globals || !globals)
+                TRAP(ST_UNSUPPORTED_OP);
+            globals[in.b] = CU_POP();
+            break;
 
         case OP_BR:
             if (in.b <= pc) {

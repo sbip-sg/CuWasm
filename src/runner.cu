@@ -10,12 +10,13 @@
 namespace cuwasm {
 
 __global__ void k_run(DevModule m, VmState* st, uint64_t* stack, Frame* frames,
-                      uint32_t stack_cap, uint32_t frame_cap, uint64_t max_steps) {
+                      uint64_t* globals, uint32_t n_globals, uint32_t stack_cap, uint32_t frame_cap,
+                      uint64_t max_steps) {
     if (blockIdx.x != 0 || threadIdx.x != 0)
         return;
     AoSView sv{stack, stack_cap, 0};
     AoSFrameView fv{frames, frame_cap, 0};
-    run_instance(m, *st, sv, fv, max_steps);
+    run_instance(m, *st, sv, fv, globals, n_globals, max_steps);
 }
 
 static bool cuda_ok(cudaError_t e, std::string& err, const char* what) {
@@ -61,6 +62,7 @@ RunResult run_gpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
     uint64_t* d_stack = nullptr;
     Frame* d_frames = nullptr;
     VmState* d_st = nullptr;
+    uint64_t* d_globals = nullptr;
 
     auto fail = [&](uint16_t status) {
         r.status = status;
@@ -70,6 +72,7 @@ RunResult run_gpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
         cudaFree(d_stack);
         cudaFree(d_frames);
         cudaFree(d_st);
+        cudaFree(d_globals);
         return r;
     };
 
@@ -90,6 +93,18 @@ RunResult run_gpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
         return fail(ST_UNSUPPORTED_OP);
     if (!cuda_ok(cudaMalloc(&d_st, sizeof(VmState)), err, "state"))
         return fail(ST_UNSUPPORTED_OP);
+    uint32_t n_globals = (uint32_t)m.globals.size();
+    if (n_globals == 0) {
+        if (!cuda_ok(cudaMalloc(&d_globals, sizeof(uint64_t)), err, "globals"))
+            return fail(ST_UNSUPPORTED_OP);
+    } else {
+        if (!cuda_ok(cudaMalloc(&d_globals, n_globals * sizeof(uint64_t)), err, "globals"))
+            return fail(ST_UNSUPPORTED_OP);
+        if (!cuda_ok(cudaMemcpy(d_globals, m.globals.data(), n_globals * sizeof(uint64_t),
+                                cudaMemcpyHostToDevice),
+                     err, "h2d globals"))
+            return fail(ST_UNSUPPORTED_OP);
+    }
 
     if (!cuda_ok(cudaMemcpy(d_code, m.code.data(), m.code.size() * sizeof(CuOp), cudaMemcpyHostToDevice),
                  err, "h2d code"))
@@ -120,7 +135,8 @@ RunResult run_gpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
     dm.n_funcs = (uint32_t)m.funcs.size();
     dm.code_len = (uint32_t)m.code.size();
 
-    k_run<<<1, 1>>>(dm, d_st, d_stack, d_frames, STACK_CAP, FRAME_CAP, max_steps);
+    k_run<<<1, 1>>>(dm, d_st, d_stack, d_frames, d_globals, n_globals, STACK_CAP, FRAME_CAP,
+                    max_steps);
     if (!cuda_ok(cudaGetLastError(), err, "launch"))
         return fail(ST_UNSUPPORTED_OP);
     if (!cuda_ok(cudaDeviceSynchronize(), err, "sync"))
@@ -138,6 +154,7 @@ RunResult run_gpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
     cudaFree(d_stack);
     cudaFree(d_frames);
     cudaFree(d_st);
+    cudaFree(d_globals);
 
     r.status = st.status;
     r.peak_csp = st.peak_csp;

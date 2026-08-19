@@ -17,6 +17,7 @@ struct HostModule {
     std::vector<uint64_t> consts;
     std::vector<FuncMeta> funcs;
     std::vector<std::pair<std::string, uint32_t>> exports;
+    std::vector<uint64_t> globals;
 
     DevModule dev() const {
         DevModule d{};

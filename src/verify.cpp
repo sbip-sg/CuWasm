@@ -135,6 +135,14 @@ bool verify_cuop(HostModule& m, std::string& err) {
                     return fail(err, "drop underflow");
                 next_h = h - 1;
                 break;
+            case OP_GLOBAL_GET:
+                next_h = h + 1;
+                break;
+            case OP_GLOBAL_SET:
+                if (h < 1)
+                    return fail(err, "global.set underflow");
+                next_h = h - 1;
+                break;
             case OP_SELECT:
                 if (h < 3)
                     return fail(err, "select underflow");
