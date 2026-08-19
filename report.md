@@ -274,3 +274,84 @@ Zero unsupported opcodes across all contract executions — every opcode issued 
 | `i32.lt_u` | 206 |
 
 Full profiles are in `docs/hello_world-run-profile.json`, `docs/increment-run-profile.json`, and `docs/token-run-profile.json`.
+
+---
+
+## Stage 2 — Multi-threaded GPU Batch Benchmark
+
+### Design
+
+Each CUDA thread runs a fully independent contract instance with private:
+- **Stack** (512 slots × 8 B = 4 KB)
+- **Frame buffer** (64 frames × 16 B = 1 KB)
+- **Globals** (3 × 8 B = 24 B)
+- **WASM linear memory** (1 MB per thread, full copy)
+- **GPU-side K/V storage** (`GpuStorage`, 16 entries × 24 B + header = 392 B)
+
+No state is shared between threads. Each instance can (and does) mutate its own memory, globals, and storage independently.
+
+Host functions are handled **entirely on-GPU** via `gpu_host_dispatch()` (`include/cuwasm/gpu_host.h`):
+- `has_contract_data` / `get_contract_data` / `put_contract_data`: per-thread K/V store lookup/insert
+- `extend_contract_data_ttl` / `extend_current_contract_instance_and_code_ttl`: no-op (TTL irrelevant for compute benchmark)
+- `require_auth`: stub (always succeeds)
+- `contract_event`: no-op
+
+CUDA events (`cudaEventRecord`) measure kernel time only, excluding H2D/D2H memory transfers.
+
+**TPS = N_completed / kernel_seconds**, where N_completed is the number of threads that reached `ST_OK`.
+
+### Hardware
+
+GPU: NVIDIA RTX A4500 (Ampere SM86, 56 SMs, 20 GB GDDR6, ~1.5 GHz boost)
+
+### Correctness verification
+
+Single-thread GPU execution matches CPU trace exactly:
+- CPU with simulated K/V store: `has_contract_data → false`, `put_contract_data(key, U32(1))`, `extend_ttl` → return `0x100000004` (U32 val 1)
+- GPU thread[0]: result = `0x100000004`, storage = `{key=0xe6a065f41d0e, val=0x100000004}` — **identical**
+
+### Benchmark results (increment contract)
+
+| N threads | Device mem | Kernel ms | TPS | ok/total |
+|---:|---:|---:|---:|---:|
+| 256 | 257 MB | 0.040 | 6.4 M | 256/256 |
+| 1,024 | 1,029 MB | 0.038 | 27.0 M | 1024/1024 |
+| 4,096 | 4,117 MB | 0.035 | 118.5 M | 4096/4096 |
+| 8,192 | 8,235 MB | 0.045 | 181.8 M | 8192/8192 |
+| 16,384 | 16,471 MB | 0.068 | 242 M | 16384/16384 |
+
+All threads complete with `ST_OK`. Device memory is dominated by per-thread WASM linear memory (1 MB × N).
+
+### Why the numbers are high
+
+The `increment` contract executes only **90 WASM opcodes and 3 GPU-side host calls** per invocation. This is an extremely light workload — a single function call that:
+1. Checks if a counter key exists (K/V lookup, ~5 cycles)
+2. Stores counter=1 (K/V insert, ~10 cycles)
+3. Extends TTL (no-op stub, ~2 cycles)
+
+The kernel time (0.068 ms at N=16384) reflects the GPU parallelism: 56 SMs × multiple warps can complete 16384 trivial tasks very quickly. The numbers would be much lower for contracts with heavier computation (e.g., the token contract with 10,060 opcodes and 48 host calls per invocation).
+
+### Block size tuning
+
+Sweep at N=8192:
+
+| block_size | Kernel ms | TPS |
+|---:|---:|---:|
+| 32 | 0.037 | 223 M |
+| **64** | **0.036** | **229 M** |
+| 128 | 0.040 | 205 M |
+| 256 | 0.046 | 178 M |
+| 512 | 0.056 | 145 M |
+
+Smaller blocks (32–64) are optimal because the switch-based interpreter has high warp divergence; fewer threads per block allows the GPU to schedule more blocks per SM, hiding divergence latency.
+
+### Memory scaling limit
+
+At N=16384, per-thread memory is 1,006 KB (dominated by the 1 MB WASM linear memory image), totaling ~16.1 GB out of 20 GB available. This is the practical limit for this GPU; higher N requires either a GPU with more memory or a contract with a smaller initial memory footprint.
+
+### Possible future optimizations
+
+1. **Heavier contract benchmarks**: token contract with realistic constructor + mint + transfer flows, to measure TPS on a more representative workload.
+2. **SoA memory layout**: transform per-thread arrays from Array-of-Structs to Struct-of-Arrays for better memory coalescing.
+3. **Persistent-thread kernel**: amortize kernel launch overhead by having threads process multiple contract instances in sequence.
+4. **Reduced linear memory**: contracts that only use a small fraction of their initial pages could use demand-paging or compressed memory.
