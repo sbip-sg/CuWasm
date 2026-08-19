@@ -300,17 +300,33 @@ fn push_ctrl(
     Ok(())
 }
 
+fn emit_jump(code: &mut Vec<CuOpC>, ctrl: &mut [Ctrl], idx: usize) {
+    if ctrl[idx].kind == CtrlKind::Loop {
+        let start = ctrl[idx].start;
+        emit(code, OP_BR, 0, start);
+    } else {
+        let pc = emit(code, OP_BR, 0, 0);
+        ctrl[idx].patches.push(pc);
+    }
+}
+
 fn lower_operators(
     ops: Vec<Operator<'_>>,
     n_params: u16,
     n_results: u16,
-    n_locals: u16,
+    mut n_locals: u16,
     code: &mut Vec<CuOpC>,
     consts: &mut Vec<u64>,
     func_types: &[(Vec<ValType>, Vec<ValType>)],
     func_typeidx: &[u32],
 ) -> Result<FuncMetaC, String> {
     let code_off = code.len() as u32;
+    let scratch = if ops.iter().any(|op| matches!(op, Operator::BrTable { .. })) {
+        n_locals = n_locals.saturating_add(1);
+        Some(n_params + n_locals - 1)
+    } else {
+        None
+    };
     let mut h: i32 = 0;
     let mut dead = false;
     let mut ctrl: Vec<Ctrl> = vec![Ctrl {
@@ -688,14 +704,7 @@ fn lower_operators(
                 if !dead {
                     emit_unwind(code, h, &ctrl[idx], n_params, n_locals)?;
                 }
-                let kind = ctrl[idx].kind;
-                if kind == CtrlKind::Loop {
-                    let start = ctrl[idx].start;
-                    emit(code, OP_BR, 0, start);
-                } else {
-                    let pc = emit(code, OP_BR, 0, 0);
-                    ctrl[idx].patches.push(pc);
-                }
+                emit_jump(code, &mut ctrl, idx);
                 dead = true;
             }
             Operator::BrIf { relative_depth } => {
@@ -706,17 +715,46 @@ fn lower_operators(
                 if !dead {
                     emit_unwind(code, h, &ctrl[idx], n_params, n_locals)?;
                 }
-                let kind = ctrl[idx].kind;
-                if kind == CtrlKind::Loop {
-                    let start = ctrl[idx].start;
-                    emit(code, OP_BR, 0, start);
-                } else {
-                    let pc = emit(code, OP_BR, 0, 0);
-                    ctrl[idx].patches.push(pc);
-                }
+                emit_jump(code, &mut ctrl, idx);
                 h = saved_h;
                 let dest = code.len() as u32;
                 patch_b(code, skip_placeholder, dest);
+            }
+            Operator::BrTable { targets } => {
+                let scratch = scratch.ok_or("br_table without scratch local")?;
+                let default = targets.default();
+                let mut depths: Vec<u32> = Vec::new();
+                for t in targets.targets() {
+                    depths.push(t.map_err(|e| format!("br_table: {e}"))?);
+                }
+                emit(code, OP_LOCAL_SET, scratch, 0);
+                consume(&mut h, dead, 1, 0)?;
+                for (i, depth) in depths.iter().copied().enumerate() {
+                    let idxc = intern(consts, i as u32 as u64);
+                    emit(code, OP_LOCAL_GET, scratch, 0);
+                    consume(&mut h, dead, 0, 1)?;
+                    emit(code, OP_I64_CONST, 0, idxc);
+                    consume(&mut h, dead, 0, 1)?;
+                    emit(code, OP_I32_EQ, 0, 0);
+                    consume(&mut h, dead, 2, 1)?;
+                    consume(&mut h, dead, 1, 0)?;
+                    let skip_placeholder = emit(code, OP_BR_IF_NOT, 0, 0);
+                    let idx = resolve_br(&ctrl, depth)?;
+                    let saved_h = h;
+                    if !dead {
+                        emit_unwind(code, h, &ctrl[idx], n_params, n_locals)?;
+                    }
+                    emit_jump(code, &mut ctrl, idx);
+                    h = saved_h;
+                    let dest = code.len() as u32;
+                    patch_b(code, skip_placeholder, dest);
+                }
+                let idx = resolve_br(&ctrl, default)?;
+                if !dead {
+                    emit_unwind(code, h, &ctrl[idx], n_params, n_locals)?;
+                }
+                emit_jump(code, &mut ctrl, idx);
+                dead = true;
             }
             Operator::Return => {
                 emit(code, OP_RETURN, n_results, 0);

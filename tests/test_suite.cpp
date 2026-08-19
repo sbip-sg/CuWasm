@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
     int n_pass = 0, n_fail = 0, n_unsup = 0, n_skip = 0, n_trap_ok = 0, n_trap_fail = 0;
     std::map<std::string, int> fail_by_file;
     std::map<std::string, int> unsup_reason;
+    std::map<std::string, int> unsup_by_file;
 
     std::string line;
     int n_cases = 0;
@@ -162,6 +163,7 @@ int main(int argc, char** argv) {
             if (r.size() > 60)
                 r = r.substr(0, 60);
             unsup_reason[r]++;
+            unsup_by_file[file]++;
             continue;
         }
         HostModule& m = mods[wasm_rel];
@@ -169,6 +171,7 @@ int main(int argc, char** argv) {
         if (fi < 0) {
             ++n_unsup;
             unsup_reason["missing export"]++;
+            unsup_by_file[file]++;
             continue;
         }
         std::vector<uint64_t> args;
@@ -178,6 +181,7 @@ int main(int argc, char** argv) {
         if (r.status == ST_UNSUPPORTED_OP) {
             ++n_unsup;
             unsup_reason["runtime unsupported"]++;
+            unsup_by_file[file]++;
             continue;
         }
         if (kind == "trap") {
@@ -222,6 +226,15 @@ int main(int argc, char** argv) {
         std::cerr << "unsupported reasons (top):\n";
         std::vector<std::pair<int, std::string>> rs;
         for (auto& kv : unsup_reason)
+            rs.push_back({kv.second, kv.first});
+        std::sort(rs.begin(), rs.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        for (size_t i = 0; i < rs.size() && i < 12; ++i)
+            std::cerr << "  " << rs[i].first << "  " << rs[i].second << "\n";
+    }
+    if (!unsup_by_file.empty()) {
+        std::cerr << "unsupported by file (top):\n";
+        std::vector<std::pair<int, std::string>> rs;
+        for (auto& kv : unsup_by_file)
             rs.push_back({kv.second, kv.first});
         std::sort(rs.begin(), rs.end(), [](auto& a, auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < rs.size() && i < 12; ++i)
