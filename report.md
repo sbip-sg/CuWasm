@@ -314,17 +314,35 @@ This is the Stellar Rust SDK's default allocation — all SDK-compiled contracts
 
 **Is it configurable?** Yes, at the contract-compilation level: a contract author could pass `--initial-memory=N` to the linker to use fewer pages. CuWASM would then allocate fewer bytes per thread automatically (it uses `hm.mem_size` which tracks `min_pages × 65536`). For these Soroban SDK contracts the minimum is fixed at 16–17 pages.
 
-### Why only `increment` is benchmarked here
+### Stage 3: GPU object heap (enabled in current build)
 
-The `hello` and `token` contracts require **Soroban object handles** as arguments:
-- `hello(to: Vec<Symbol>)` — the `to` arg is a `VecObject`, a heap-allocated host object
-- `token::balance(id: Address)` — the `id` arg is an `AddressObject`
+`hello` and `token` require **Soroban object handles** as arguments:
+- `hello(to: Vec<Symbol>)` — argument is a `StringObject` (relative handle, tag byte `0x49`)
+- `token::balance(id: Address)` — argument is an `AddressObject` (relative handle, tag byte `0x4D`)
 
-These handles are created by the host (`host.string_new_from_slice(...)`, `host.vec_new_from_slice(...)`) and reference entries in the host's object heap. Without a host context on the GPU, there is no valid object heap, so any handle passed will fail the contract's own inline tag-check (triggering `trap_unreachable`).
+Stage 3 adds a per-thread `GpuObjHeap` to `gpu_host.h`. The heap allocates up to 32 objects per thread and stores inline data (≤16 B). The Soroban Val encoding used is the soroban-env-common v22 layout:
 
-`increment()` takes **zero arguments** — it only reads/writes its own storage — which is why it works end-to-end with the GPU K/V simulation.
+```
+raw Val = (handle_index << 8) | tag_byte
+```
 
-Extending to `token` would require adding a per-thread GPU object heap (strings, vecs, addresses) to `gpu_host.h`. This is future work.
+| Tag | Value | Meaning |
+|---|---:|---|
+| `StringObject` | 73 (0x49) | byte string |
+| `VecObject` | 75 (0x4B) | array of Vals |
+| `AddressObject` | 77 (0x4D) | account/contract address |
+| `I128Object` | 69 (0x45) | 128-bit integer |
+| `SymbolObject` | 74 (0x4A) | symbol |
+
+`U32Val` pointer/length arguments encode as `raw = (u32_value << 32) | 4`; decode as `value = raw >> 32`.
+
+Handled host functions (per-thread, no host crossing):
+- `string_new_from_linear_memory`, `symbol_new_from_linear_memory`: copy bytes from WASM memory into heap entry
+- `vec_new_from_linear_memory`: copy element Vals from WASM memory
+- `map_new_from_linear_memory`, `map_unpack_to_linear_memory`: stub
+- `obj_from_i128_pieces`, `obj_to_i128_lo64`, `obj_to_i128_hi64`: encode/decode 128-bit integers
+- `has/get/put_contract_data`: per-thread K/V ledger storage (unchanged from before)
+- `extend_*_ttl`, `require_auth`, `contract_event`: no-ops
 
 ### Hardware
 
@@ -332,34 +350,56 @@ GPU: NVIDIA RTX A4500 (Ampere SM86, 56 SMs, 20 GB GDDR6, ~1.5 GHz boost)
 
 ### Correctness verification
 
-Single-thread GPU execution matches CPU trace exactly:
+Single-thread GPU execution matches CPU trace exactly for `increment`:
 - CPU with simulated K/V store: `has_contract_data → false`, `put_contract_data(key, U32(1))`, `extend_ttl` → return `0x100000004` (U32 val 1)
 - GPU thread[0]: result = `0x100000004`, storage = `{key=0xe6a065f41d0e, val=0x100000004}` — **identical**
 
-### Benchmark results (increment contract)
+For `hello`: GPU thread[0] result = `0x14b` = VecObject(handle=1), 2 heap objects allocated (StringObject for "World", VecObject for `["Hello","World"]`) — correct.
 
-| N threads | Device mem | Kernel ms | TPS | ok/total |
-|---:|---:|---:|---:|---:|
-| 256 | 257 MB | 0.040 | 6.4 M | 256/256 |
-| 1,024 | 1,029 MB | 0.038 | 27.0 M | 1024/1024 |
-| 4,096 | 4,117 MB | 0.035 | 118.5 M | 4096/4096 |
-| 8,192 | 8,235 MB | 0.045 | 181.8 M | 8192/8192 |
-| 16,384 | 16,471 MB | 0.068 | 242 M | 16384/16384 |
+For `token::balance`: GPU thread[0] result = `0x0b` = I128Small(0) (empty storage → balance=0) — correct.
 
-All threads complete with `ST_OK`. Device memory is dominated by per-thread WASM linear memory (1 MB × N).
+### Benchmark results — all contracts
 
-### Why the numbers are high
+All benchmarks: block_size=64, hardware = NVIDIA RTX A4500 (56 SMs, 20 GB GDDR6).
 
-The `increment` contract executes only **90 WASM opcodes and 3 GPU-side host calls** per invocation. This is an extremely light workload — a single function call that:
-1. Checks if a counter key exists (K/V lookup, ~5 cycles)
-2. Stores counter=1 (K/V insert, ~10 cycles)
-3. Extends TTL (no-op stub, ~2 cycles)
+#### `soroban_increment_contract` — lightest workload
+90 opcodes, 3 host calls (has/put K/V + extend TTL no-op).
 
-The kernel time (0.068 ms at N=16384) reflects the GPU parallelism: 56 SMs × multiple warps can complete 16384 trivial tasks very quickly. The numbers would be much lower for contracts with heavier computation (e.g., the token contract with 10,060 opcodes and 48 host calls per invocation).
+| N threads | Device mem | Kernel ms | TPS |
+|---:|---:|---:|---:|
+| 1,024 | 1,030 MB | 0.035 | 29.4 M |
+| 4,096 | 4,120 MB | 0.028 | 143.8 M |
+| 8,192 | 8,241 MB | 0.038 | 216.2 M |
 
-### Block size tuning
+#### `soroban_hello_world_contract` — medium workload
+~129 opcodes, 2 host calls (string + vec constructor). Requires object heap.
 
-Sweep at N=8192:
+| N threads | Device mem | Kernel ms | TPS |
+|---:|---:|---:|---:|
+| 1,024 | 1,094 MB | 0.054 | 18.9 M |
+| 4,096 | 4,376 MB | 0.074 | 55.6 M |
+| 8,192 | 8,753 MB | 0.096 | 85.1 M |
+
+#### `soroban_token_contract::balance` — heaviest, most realistic workload
+~10,060 opcodes, 17 vec constructors + 6 has/get K/V + 6 TTL ext + misc per full scenario.
+`balance` alone: ~1,000 opcodes, 3 host calls (TTL extend, vec constructor, has K/V).
+
+| N threads | Device mem | Kernel ms | TPS |
+|---:|---:|---:|---:|
+| 1,024 | 1,094 MB | 0.229 | 4.5 M |
+| 4,096 | 4,376 MB | 0.290 | 14.1 M |
+| 8,192 | 8,753 MB | 0.371 | 22.1 M |
+| 16,384 | 17,507 MB | 0.727 | 22.5 M |
+
+All threads complete with `ST_OK`. VRAM is dominated by per-thread WASM linear memory (1.06 MB × N for hello/token, 1.00 MB × N for increment).
+
+### Interpreting the TPS numbers
+
+The TPS values (4–216 M) reflect **raw parallel throughput on identical workloads**. In a real system, each transaction would differ (different keys, amounts, call paths) causing warp divergence to increase and TPS to drop. The present numbers represent the best-case upper bound for GPU-parallel contract execution.
+
+The `token::balance` result (~22 M TPS) is the most realistic signal: this contract performs actual storage lookups, object heap operations (vec construction), and is the type of query that blockchains execute at high frequency.
+
+### Block size tuning (increment, N=8192)
 
 | block_size | Kernel ms | TPS |
 |---:|---:|---:|
@@ -371,13 +411,9 @@ Sweep at N=8192:
 
 Smaller blocks (32–64) are optimal because the switch-based interpreter has high warp divergence; fewer threads per block allows the GPU to schedule more blocks per SM, hiding divergence latency.
 
-### Memory scaling limit
-
-At N=16384, per-thread memory is 1,006 KB (dominated by the 1 MB WASM linear memory image), totaling ~16.1 GB out of 20 GB available. This is the practical limit for this GPU; higher N requires either a GPU with more memory or a contract with a smaller initial memory footprint.
-
 ### Compute sanitizer results
 
-`compute-sanitizer` was run on the `increment` benchmark (N=256, block_size=64) to check for memory safety issues:
+`compute-sanitizer` run on `increment` (N=256, block_size=64):
 
 ```
 compute-sanitizer --tool memcheck  build/bench ... → ERROR SUMMARY: 0 errors
@@ -385,11 +421,11 @@ compute-sanitizer --tool racecheck build/bench ... → RACECHECK SUMMARY: 0 haza
 compute-sanitizer --tool initcheck build/bench ... → ERROR SUMMARY: 0 errors
 ```
 
-No out-of-bounds accesses, race conditions, or reads from uninitialized memory. Each thread's private arrays (stack, frames, globals, memory, storage) are indexed by `tid × stride` and never overlap.
+No out-of-bounds accesses, race conditions, or reads from uninitialized memory. Each thread's private arrays (stack, frames, globals, memory, host state) are indexed by `tid × stride` and never overlap.
 
 ### Possible future optimizations
 
-1. **GPU object heap**: implement per-thread heap for Soroban object types (strings, vecs, addresses, i128) in `gpu_host.h` to enable benchmarking `hello` and `token` contracts.
-2. **SoA memory layout**: transform per-thread arrays from Array-of-Structs to Struct-of-Arrays for better memory coalescing.
-3. **Persistent-thread kernel**: amortize kernel launch overhead by having threads process multiple contract instances in sequence.
-4. **Reduced linear memory**: contracts that only use a small fraction of their initial pages could use demand-paging or compressed memory; this would directly reduce VRAM usage and allow more threads.
+1. **SoA memory layout**: transform per-thread arrays from Array-of-Structs to Struct-of-Arrays for better memory coalescing.
+2. **Persistent-thread kernel**: amortize kernel launch overhead by having threads process multiple contract instances in sequence.
+3. **Reduced linear memory**: contracts using only a small fraction of their initial pages could use demand-paging or compressed layouts to reduce VRAM usage and allow more threads.
+4. **Speculative object handles**: pre-allocate a deterministic handle assignment so all threads in a warp follow the same branch path (reduces warp divergence in tag-check code).
