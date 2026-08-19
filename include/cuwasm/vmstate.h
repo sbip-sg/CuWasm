@@ -11,7 +11,9 @@ enum Status : uint16_t {
     ST_TRAP_STACK_OVERFLOW,
     ST_TRAP_CALL_DEPTH,
     ST_OUT_OF_FUEL,
-    ST_UNSUPPORTED_OP
+    ST_UNSUPPORTED_OP,
+    ST_TRAP_DIV_BY_ZERO,
+    ST_TRAP_INT_OVERFLOW
 };
 
 inline const char* status_name(uint16_t s) {
@@ -23,6 +25,8 @@ inline const char* status_name(uint16_t s) {
     case ST_TRAP_CALL_DEPTH: return "trap_call_depth";
     case ST_OUT_OF_FUEL: return "out_of_fuel";
     case ST_UNSUPPORTED_OP: return "unsupported_op";
+    case ST_TRAP_DIV_BY_ZERO: return "trap_div_by_zero";
+    case ST_TRAP_INT_OVERFLOW: return "trap_int_overflow";
     default: return "unknown";
     }
 }

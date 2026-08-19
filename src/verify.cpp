@@ -76,14 +76,69 @@ bool verify_cuop(HostModule& m, std::string& err) {
             case OP_I64_EQ:
             case OP_I64_LE_S:
             case OP_I64_LT_S:
+            case OP_I32_EQ:
+            case OP_I32_NE:
+            case OP_I32_LT_S:
+            case OP_I32_LT_U:
+            case OP_I32_LE_S:
+            case OP_I32_LE_U:
+            case OP_I32_GT_S:
+            case OP_I32_GT_U:
+            case OP_I32_GE_S:
+            case OP_I32_GE_U:
+            case OP_I32_ADD:
+            case OP_I32_SUB:
+            case OP_I32_MUL:
+            case OP_I32_AND:
+            case OP_I32_OR:
+            case OP_I32_XOR:
+            case OP_I32_DIV_S:
+            case OP_I32_DIV_U:
+            case OP_I32_REM_S:
+            case OP_I32_REM_U:
+            case OP_I32_SHL:
+            case OP_I32_SHR_S:
+            case OP_I32_SHR_U:
+            case OP_I64_NE:
+            case OP_I64_LT_U:
+            case OP_I64_LE_U:
+            case OP_I64_GT_S:
+            case OP_I64_GT_U:
+            case OP_I64_GE_S:
+            case OP_I64_GE_U:
+            case OP_I64_MUL:
+            case OP_I64_AND:
+            case OP_I64_OR:
+            case OP_I64_XOR:
+            case OP_I64_DIV_S:
+            case OP_I64_DIV_U:
+            case OP_I64_REM_S:
+            case OP_I64_REM_U:
+            case OP_I64_SHL:
+            case OP_I64_SHR_S:
+            case OP_I64_SHR_U:
                 if (h < 2)
                     return fail(err, "binop underflow");
                 next_h = h - 1;
                 break;
             case OP_I64_EQZ:
+            case OP_I32_EQZ:
+            case OP_I32_WRAP_I64:
+            case OP_I64_EXTEND_I32_S:
+            case OP_I64_EXTEND_I32_U:
                 if (h < 1)
-                    return fail(err, "eqz underflow");
+                    return fail(err, "unop underflow");
                 next_h = h;
+                break;
+            case OP_DROP:
+                if (h < 1)
+                    return fail(err, "drop underflow");
+                next_h = h - 1;
+                break;
+            case OP_SELECT:
+                if (h < 3)
+                    return fail(err, "select underflow");
+                next_h = h - 2;
                 break;
             case OP_BR: {
                 if (in.b < f.code_off || in.b >= f.code_off + f.code_len)

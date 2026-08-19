@@ -22,6 +22,53 @@ pub const OP_CALL: u16 = 12;
 pub const OP_RETURN_CALL: u16 = 13;
 pub const OP_RETURN: u16 = 14;
 pub const OP_END_FUNC: u16 = 15;
+pub const OP_DROP: u16 = 16;
+pub const OP_SELECT: u16 = 17;
+pub const OP_I32_EQZ: u16 = 18;
+pub const OP_I32_EQ: u16 = 19;
+pub const OP_I32_NE: u16 = 20;
+pub const OP_I32_LT_S: u16 = 21;
+pub const OP_I32_LT_U: u16 = 22;
+pub const OP_I32_LE_S: u16 = 23;
+pub const OP_I32_LE_U: u16 = 24;
+pub const OP_I32_GT_S: u16 = 25;
+pub const OP_I32_GT_U: u16 = 26;
+pub const OP_I32_GE_S: u16 = 27;
+pub const OP_I32_GE_U: u16 = 28;
+pub const OP_I32_ADD: u16 = 29;
+pub const OP_I32_SUB: u16 = 30;
+pub const OP_I32_MUL: u16 = 31;
+pub const OP_I32_AND: u16 = 32;
+pub const OP_I32_OR: u16 = 33;
+pub const OP_I32_XOR: u16 = 34;
+pub const OP_I32_DIV_S: u16 = 35;
+pub const OP_I32_DIV_U: u16 = 36;
+pub const OP_I32_REM_S: u16 = 37;
+pub const OP_I32_REM_U: u16 = 38;
+pub const OP_I32_SHL: u16 = 39;
+pub const OP_I32_SHR_S: u16 = 40;
+pub const OP_I32_SHR_U: u16 = 41;
+pub const OP_I32_WRAP_I64: u16 = 42;
+pub const OP_I64_NE: u16 = 43;
+pub const OP_I64_LT_U: u16 = 44;
+pub const OP_I64_LE_U: u16 = 45;
+pub const OP_I64_GT_S: u16 = 46;
+pub const OP_I64_GT_U: u16 = 47;
+pub const OP_I64_GE_S: u16 = 48;
+pub const OP_I64_GE_U: u16 = 49;
+pub const OP_I64_MUL: u16 = 50;
+pub const OP_I64_AND: u16 = 51;
+pub const OP_I64_OR: u16 = 52;
+pub const OP_I64_XOR: u16 = 53;
+pub const OP_I64_DIV_S: u16 = 54;
+pub const OP_I64_DIV_U: u16 = 55;
+pub const OP_I64_REM_S: u16 = 56;
+pub const OP_I64_REM_U: u16 = 57;
+pub const OP_I64_SHL: u16 = 58;
+pub const OP_I64_SHR_S: u16 = 59;
+pub const OP_I64_SHR_U: u16 = 60;
+pub const OP_I64_EXTEND_I32_S: u16 = 61;
+pub const OP_I64_EXTEND_I32_U: u16 = 62;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -116,9 +163,9 @@ fn patch_b(code: &mut [CuOpC], pc: u32, b: u32) {
     code[pc as usize].b = b;
 }
 
-fn only_i64(ts: &[ValType]) -> Result<(), String> {
+fn only_int(ts: &[ValType]) -> Result<(), String> {
     for t in ts {
-        if *t != ValType::I64 {
+        if *t != ValType::I64 && *t != ValType::I32 {
             return Err(format!("unsupported valtype {:?}", t));
         }
     }
@@ -160,6 +207,157 @@ fn lower_operators(
             Operator::I64Const { value } => {
                 let idx = intern(consts, value as u64);
                 emit(code, OP_I64_CONST, 0, idx);
+            }
+            Operator::I32Const { value } => {
+                let idx = intern(consts, value as u32 as u64);
+                emit(code, OP_I64_CONST, 0, idx);
+            }
+            Operator::Drop => {
+                emit(code, OP_DROP, 0, 0);
+            }
+            Operator::Select => {
+                emit(code, OP_SELECT, 0, 0);
+            }
+            Operator::TypedSelect { .. } => {
+                emit(code, OP_SELECT, 0, 0);
+            }
+            Operator::I32Eqz => {
+                emit(code, OP_I32_EQZ, 0, 0);
+            }
+            Operator::I32Eq => {
+                emit(code, OP_I32_EQ, 0, 0);
+            }
+            Operator::I32Ne => {
+                emit(code, OP_I32_NE, 0, 0);
+            }
+            Operator::I32LtS => {
+                emit(code, OP_I32_LT_S, 0, 0);
+            }
+            Operator::I32LtU => {
+                emit(code, OP_I32_LT_U, 0, 0);
+            }
+            Operator::I32LeS => {
+                emit(code, OP_I32_LE_S, 0, 0);
+            }
+            Operator::I32LeU => {
+                emit(code, OP_I32_LE_U, 0, 0);
+            }
+            Operator::I32GtS => {
+                emit(code, OP_I32_GT_S, 0, 0);
+            }
+            Operator::I32GtU => {
+                emit(code, OP_I32_GT_U, 0, 0);
+            }
+            Operator::I32GeS => {
+                emit(code, OP_I32_GE_S, 0, 0);
+            }
+            Operator::I32GeU => {
+                emit(code, OP_I32_GE_U, 0, 0);
+            }
+            Operator::I32Add => {
+                emit(code, OP_I32_ADD, 0, 0);
+            }
+            Operator::I32Sub => {
+                emit(code, OP_I32_SUB, 0, 0);
+            }
+            Operator::I32Mul => {
+                emit(code, OP_I32_MUL, 0, 0);
+            }
+            Operator::I32And => {
+                emit(code, OP_I32_AND, 0, 0);
+            }
+            Operator::I32Or => {
+                emit(code, OP_I32_OR, 0, 0);
+            }
+            Operator::I32Xor => {
+                emit(code, OP_I32_XOR, 0, 0);
+            }
+            Operator::I32DivS => {
+                emit(code, OP_I32_DIV_S, 0, 0);
+            }
+            Operator::I32DivU => {
+                emit(code, OP_I32_DIV_U, 0, 0);
+            }
+            Operator::I32RemS => {
+                emit(code, OP_I32_REM_S, 0, 0);
+            }
+            Operator::I32RemU => {
+                emit(code, OP_I32_REM_U, 0, 0);
+            }
+            Operator::I32Shl => {
+                emit(code, OP_I32_SHL, 0, 0);
+            }
+            Operator::I32ShrS => {
+                emit(code, OP_I32_SHR_S, 0, 0);
+            }
+            Operator::I32ShrU => {
+                emit(code, OP_I32_SHR_U, 0, 0);
+            }
+            Operator::I32WrapI64 => {
+                emit(code, OP_I32_WRAP_I64, 0, 0);
+            }
+            Operator::I64Ne => {
+                emit(code, OP_I64_NE, 0, 0);
+            }
+            Operator::I64LtU => {
+                emit(code, OP_I64_LT_U, 0, 0);
+            }
+            Operator::I64LeU => {
+                emit(code, OP_I64_LE_U, 0, 0);
+            }
+            Operator::I64GtS => {
+                emit(code, OP_I64_GT_S, 0, 0);
+            }
+            Operator::I64GtU => {
+                emit(code, OP_I64_GT_U, 0, 0);
+            }
+            Operator::I64GeS => {
+                emit(code, OP_I64_GE_S, 0, 0);
+            }
+            Operator::I64GeU => {
+                emit(code, OP_I64_GE_U, 0, 0);
+            }
+            Operator::I64Mul => {
+                emit(code, OP_I64_MUL, 0, 0);
+            }
+            Operator::I64And => {
+                emit(code, OP_I64_AND, 0, 0);
+            }
+            Operator::I64Or => {
+                emit(code, OP_I64_OR, 0, 0);
+            }
+            Operator::I64Xor => {
+                emit(code, OP_I64_XOR, 0, 0);
+            }
+            Operator::I64DivS => {
+                emit(code, OP_I64_DIV_S, 0, 0);
+            }
+            Operator::I64DivU => {
+                emit(code, OP_I64_DIV_U, 0, 0);
+            }
+            Operator::I64RemS => {
+                emit(code, OP_I64_REM_S, 0, 0);
+            }
+            Operator::I64RemU => {
+                emit(code, OP_I64_REM_U, 0, 0);
+            }
+            Operator::I64Shl => {
+                emit(code, OP_I64_SHL, 0, 0);
+            }
+            Operator::I64ShrS => {
+                emit(code, OP_I64_SHR_S, 0, 0);
+            }
+            Operator::I64ShrU => {
+                emit(code, OP_I64_SHR_U, 0, 0);
+            }
+            Operator::I64Extend32S => {
+                emit(code, OP_I64_EXTEND_I32_S, 0, 0);
+            }
+            Operator::I64ExtendI32S => {
+                emit(code, OP_I64_EXTEND_I32_S, 0, 0);
+            }
+            Operator::I64ExtendI32U => {
+                emit(code, OP_I64_EXTEND_I32_U, 0, 0);
             }
             Operator::LocalGet { local_index } => {
                 emit(code, OP_LOCAL_GET, local_index as u16, 0);
@@ -332,8 +530,8 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                             CompositeInnerType::Func(ft) => {
                                 let params = ft.params().to_vec();
                                 let results = ft.results().to_vec();
-                                only_i64(&params)?;
-                                only_i64(&results)?;
+                                only_int(&params)?;
+                                only_int(&results)?;
                                 func_types.push((params, results));
                             }
                             _ => return Err("non-func type in type section".into()),
@@ -380,8 +578,8 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                     .map_err(|e| format!("locals: {e}"))?;
                 for loc in locals_reader {
                     let (cnt, ty) = loc.map_err(|e| format!("local: {e}"))?;
-                    if ty != ValType::I64 {
-                        return Err(format!("non-i64 local {:?}", ty));
+                    if ty != ValType::I64 && ty != ValType::I32 {
+                        return Err(format!("non-int local {:?}", ty));
                     }
                     n_locals = n_locals
                         .checked_add(cnt)

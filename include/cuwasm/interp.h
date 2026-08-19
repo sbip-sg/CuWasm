@@ -73,6 +73,274 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
             break;
         }
 
+        case OP_DROP:
+            (void)CU_POP();
+            break;
+        case OP_SELECT: {
+            uint32_t c = (uint32_t)CU_POP();
+            uint64_t b = CU_POP();
+            uint64_t a = CU_POP();
+            CU_PUSH(c ? a : b);
+            break;
+        }
+
+        case OP_I32_EQZ: {
+            uint32_t a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a == 0));
+            break;
+        }
+        case OP_I32_EQ: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a == b));
+            break;
+        }
+        case OP_I32_NE: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a != b));
+            break;
+        }
+        case OP_I32_LT_S: {
+            int32_t b = (int32_t)CU_POP(), a = (int32_t)CU_POP();
+            CU_PUSH((uint32_t)(a < b));
+            break;
+        }
+        case OP_I32_LT_U: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a < b));
+            break;
+        }
+        case OP_I32_LE_S: {
+            int32_t b = (int32_t)CU_POP(), a = (int32_t)CU_POP();
+            CU_PUSH((uint32_t)(a <= b));
+            break;
+        }
+        case OP_I32_LE_U: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a <= b));
+            break;
+        }
+        case OP_I32_GT_S: {
+            int32_t b = (int32_t)CU_POP(), a = (int32_t)CU_POP();
+            CU_PUSH((uint32_t)(a > b));
+            break;
+        }
+        case OP_I32_GT_U: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a > b));
+            break;
+        }
+        case OP_I32_GE_S: {
+            int32_t b = (int32_t)CU_POP(), a = (int32_t)CU_POP();
+            CU_PUSH((uint32_t)(a >= b));
+            break;
+        }
+        case OP_I32_GE_U: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a >= b));
+            break;
+        }
+        case OP_I32_ADD: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a + b));
+            break;
+        }
+        case OP_I32_SUB: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a - b));
+            break;
+        }
+        case OP_I32_MUL: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a * b));
+            break;
+        }
+        case OP_I32_AND: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH(a & b);
+            break;
+        }
+        case OP_I32_OR: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH(a | b);
+            break;
+        }
+        case OP_I32_XOR: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            CU_PUSH(a ^ b);
+            break;
+        }
+        case OP_I32_DIV_S: {
+            int32_t b = (int32_t)CU_POP(), a = (int32_t)CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            if (a == (int32_t)0x80000000 && b == -1)
+                TRAP(ST_TRAP_INT_OVERFLOW);
+            CU_PUSH((uint32_t)(a / b));
+            break;
+        }
+        case OP_I32_DIV_U: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            CU_PUSH(a / b);
+            break;
+        }
+        case OP_I32_REM_S: {
+            int32_t b = (int32_t)CU_POP(), a = (int32_t)CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            if (a == (int32_t)0x80000000 && b == -1) {
+                CU_PUSH(0);
+                break;
+            }
+            CU_PUSH((uint32_t)(a % b));
+            break;
+        }
+        case OP_I32_REM_U: {
+            uint32_t b = (uint32_t)CU_POP(), a = (uint32_t)CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            CU_PUSH(a % b);
+            break;
+        }
+        case OP_I32_SHL: {
+            uint32_t b = (uint32_t)CU_POP() & 31u, a = (uint32_t)CU_POP();
+            CU_PUSH((uint32_t)(a << b));
+            break;
+        }
+        case OP_I32_SHR_S: {
+            uint32_t b = (uint32_t)CU_POP() & 31u;
+            int32_t a = (int32_t)CU_POP();
+            CU_PUSH((uint32_t)(a >> b));
+            break;
+        }
+        case OP_I32_SHR_U: {
+            uint32_t b = (uint32_t)CU_POP() & 31u, a = (uint32_t)CU_POP();
+            CU_PUSH(a >> b);
+            break;
+        }
+        case OP_I32_WRAP_I64: {
+            uint64_t a = CU_POP();
+            CU_PUSH((uint32_t)a);
+            break;
+        }
+
+        case OP_I64_NE: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH((uint32_t)(a != b));
+            break;
+        }
+        case OP_I64_LT_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH((uint32_t)(a < b));
+            break;
+        }
+        case OP_I64_LE_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH((uint32_t)(a <= b));
+            break;
+        }
+        case OP_I64_GT_S: {
+            int64_t b = (int64_t)CU_POP(), a = (int64_t)CU_POP();
+            CU_PUSH((uint32_t)(a > b));
+            break;
+        }
+        case OP_I64_GT_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH((uint32_t)(a > b));
+            break;
+        }
+        case OP_I64_GE_S: {
+            int64_t b = (int64_t)CU_POP(), a = (int64_t)CU_POP();
+            CU_PUSH((uint32_t)(a >= b));
+            break;
+        }
+        case OP_I64_GE_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH((uint32_t)(a >= b));
+            break;
+        }
+        case OP_I64_MUL: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH(a * b);
+            break;
+        }
+        case OP_I64_AND: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH(a & b);
+            break;
+        }
+        case OP_I64_OR: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH(a | b);
+            break;
+        }
+        case OP_I64_XOR: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            CU_PUSH(a ^ b);
+            break;
+        }
+        case OP_I64_DIV_S: {
+            int64_t b = (int64_t)CU_POP(), a = (int64_t)CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            if (a == (int64_t)((uint64_t)1 << 63) && b == -1)
+                TRAP(ST_TRAP_INT_OVERFLOW);
+            CU_PUSH((uint64_t)(a / b));
+            break;
+        }
+        case OP_I64_DIV_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            CU_PUSH(a / b);
+            break;
+        }
+        case OP_I64_REM_S: {
+            int64_t b = (int64_t)CU_POP(), a = (int64_t)CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            if (a == (int64_t)((uint64_t)1 << 63) && b == -1) {
+                CU_PUSH(0);
+                break;
+            }
+            CU_PUSH((uint64_t)(a % b));
+            break;
+        }
+        case OP_I64_REM_U: {
+            uint64_t b = CU_POP(), a = CU_POP();
+            if (b == 0)
+                TRAP(ST_TRAP_DIV_BY_ZERO);
+            CU_PUSH(a % b);
+            break;
+        }
+        case OP_I64_SHL: {
+            uint64_t b = CU_POP() & 63u, a = CU_POP();
+            CU_PUSH(a << b);
+            break;
+        }
+        case OP_I64_SHR_S: {
+            uint64_t b = CU_POP() & 63u;
+            int64_t a = (int64_t)CU_POP();
+            CU_PUSH((uint64_t)(a >> b));
+            break;
+        }
+        case OP_I64_SHR_U: {
+            uint64_t b = CU_POP() & 63u, a = CU_POP();
+            CU_PUSH(a >> b);
+            break;
+        }
+        case OP_I64_EXTEND_I32_S: {
+            uint64_t a = CU_POP();
+            CU_PUSH((uint64_t)(int64_t)(int32_t)a);
+            break;
+        }
+        case OP_I64_EXTEND_I32_U: {
+            uint64_t a = CU_POP();
+            CU_PUSH((uint64_t)(uint32_t)a);
+            break;
+        }
+
         case OP_BR:
             if (in.b <= pc) {
                 if ((fuel -= FUEL_BACKEDGE) <= 0)

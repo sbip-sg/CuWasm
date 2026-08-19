@@ -136,7 +136,7 @@ static int test_lowering_and_verify(const std::string& gen) {
         expect(load_mod(i, gen, m, err), "lower+verify mod" + std::to_string(i) + ": " + err);
         bool any_bad = false;
         for (const auto& op : m.code) {
-            if (op.op > cuwasm::OP_END_FUNC)
+            if (std::string(cuwasm::opcode_name(op.op)) == "???")
                 any_bad = true;
         }
         expect(!any_bad, "mod" + std::to_string(i) + " has unsupported cuop");
