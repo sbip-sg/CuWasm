@@ -1,5 +1,7 @@
 use std::os::raw::{c_int, c_void};
 
+pub const CUWASM_CAPI_OP_COUNT: usize = 81;
+
 #[repr(C)]
 pub struct CuwasmModule {
     _private: [u8; 0],
@@ -25,6 +27,13 @@ pub struct CuwasmRunResult {
     pub error: [u8; 256],
 }
 
+#[repr(C)]
+pub struct CuwasmRunProfile {
+    pub opcode_counts: [u64; CUWASM_CAPI_OP_COUNT],
+    pub unsupported_opcode_counts: [u64; CUWASM_CAPI_OP_COUNT],
+    pub total_ops: u64,
+}
+
 extern "C" {
     pub fn cuwasm_module_load(
         wasm: *const u8,
@@ -45,5 +54,6 @@ extern "C" {
         host: CuwasmHostFn,
         ctx: *mut c_void,
         out: *mut CuwasmRunResult,
+        profile: *mut CuwasmRunProfile,
     ) -> c_int;
 }

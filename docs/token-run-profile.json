@@ -1,0 +1,221 @@
+{
+  "contract": "soroban_token_contract.wasm",
+  "scenarios": [
+    {
+      "export": "mint/balance/transfer/balance",
+      "host_calls": [
+        {
+          "name": "contract_event",
+          "arg_count": 2,
+          "count": 2
+        },
+        {
+          "name": "extend_contract_data_ttl",
+          "arg_count": 4,
+          "count": 6
+        },
+        {
+          "name": "extend_current_contract_instance_and_code_ttl",
+          "arg_count": 2,
+          "count": 4
+        },
+        {
+          "name": "get_contract_data",
+          "arg_count": 2,
+          "count": 4
+        },
+        {
+          "name": "has_contract_data",
+          "arg_count": 2,
+          "count": 6
+        },
+        {
+          "name": "obj_to_i128_hi64",
+          "arg_count": 1,
+          "count": 2
+        },
+        {
+          "name": "obj_to_i128_lo64",
+          "arg_count": 1,
+          "count": 2
+        },
+        {
+          "name": "put_contract_data",
+          "arg_count": 3,
+          "count": 3
+        },
+        {
+          "name": "require_auth",
+          "arg_count": 1,
+          "count": 2
+        },
+        {
+          "name": "vec_new_from_linear_memory",
+          "arg_count": 2,
+          "count": 17
+        }
+      ],
+      "host_calls_total": 48,
+      "opcodes": [
+        {
+          "op": "local.get",
+          "count": 2336
+        },
+        {
+          "op": "i64.const",
+          "count": 2291
+        },
+        {
+          "op": "local.set",
+          "count": 925
+        },
+        {
+          "op": "i32.add",
+          "count": 751
+        },
+        {
+          "op": "br_if_not",
+          "count": 659
+        },
+        {
+          "op": "br",
+          "count": 330
+        },
+        {
+          "op": "i32.and",
+          "count": 299
+        },
+        {
+          "op": "load",
+          "count": 271
+        },
+        {
+          "op": "store",
+          "count": 212
+        },
+        {
+          "op": "i32.lt_u",
+          "count": 206
+        },
+        {
+          "op": "i64.or",
+          "count": 178
+        },
+        {
+          "op": "i64.shl",
+          "count": 171
+        },
+        {
+          "op": "global.set",
+          "count": 170
+        },
+        {
+          "op": "i32.eq",
+          "count": 153
+        },
+        {
+          "op": "i64.extend_i32_u",
+          "count": 152
+        },
+        {
+          "op": "call",
+          "count": 134
+        },
+        {
+          "op": "end",
+          "count": 125
+        },
+        {
+          "op": "i32.eqz",
+          "count": 124
+        },
+        {
+          "op": "i64.and",
+          "count": 112
+        },
+        {
+          "op": "i32.gt_u",
+          "count": 88
+        },
+        {
+          "op": "i32.sub",
+          "count": 85
+        },
+        {
+          "op": "global.get",
+          "count": 85
+        },
+        {
+          "op": "call_host",
+          "count": 48
+        },
+        {
+          "op": "i64.xor",
+          "count": 22
+        },
+        {
+          "op": "i32.ne",
+          "count": 18
+        },
+        {
+          "op": "drop",
+          "count": 17
+        },
+        {
+          "op": "i64.eqz",
+          "count": 14
+        },
+        {
+          "op": "i64.add",
+          "count": 13
+        },
+        {
+          "op": "return",
+          "count": 13
+        },
+        {
+          "op": "i64.shr_s",
+          "count": 13
+        },
+        {
+          "op": "i64.eq",
+          "count": 10
+        },
+        {
+          "op": "i64.ne",
+          "count": 10
+        },
+        {
+          "op": "i64.gt_u",
+          "count": 7
+        },
+        {
+          "op": "i64.lt_s",
+          "count": 5
+        },
+        {
+          "op": "i32.wrap_i64",
+          "count": 5
+        },
+        {
+          "op": "i64.sub",
+          "count": 3
+        },
+        {
+          "op": "i64.lt_u",
+          "count": 3
+        },
+        {
+          "op": "select",
+          "count": 1
+        },
+        {
+          "op": "i64.ge_s",
+          "count": 1
+        }
+      ],
+      "opcodes_total": 10060,
+      "unsupported_opcodes": []
+    }
+  ]
+}

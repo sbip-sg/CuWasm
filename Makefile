@@ -14,15 +14,21 @@ ORACLE := $(BUILD)/cuwasm-oracle
 WASTPREP := $(BUILD)/wastprep
 RUST_LIBS := -ldl -lpthread -lm -lgcc_s
 
-.PHONY: test-hello-world test-increment test-contract-tests
+.PHONY: test-hello-world test-increment test-token test-contract-tests emit-profiles
 test-hello-world: $(RUSTLIB)
 	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml test_hello_world -- --nocapture
 
 test-increment: $(RUSTLIB)
 	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml test_increment -- --nocapture
 
+test-token: $(RUSTLIB)
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml test_token -- --nocapture
+
 test-contract-tests: $(RUSTLIB)
 	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml -- --nocapture
+
+emit-profiles: $(RUSTLIB)
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo run --release --manifest-path tools/contract-tests/Cargo.toml --bin emit-profiles
 
 CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp src/capi.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)

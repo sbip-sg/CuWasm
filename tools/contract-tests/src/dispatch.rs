@@ -1,6 +1,8 @@
 use crate::capi::CuwasmMailbox;
 use crate::env_ids;
-use soroban_env_common::{Env, EnvBase, Object, StorageType, Tag, U32Val, Val};
+use soroban_env_common::{
+    AddressObject, Env, EnvBase, MapObject, Object, StorageType, Tag, U32Val, Val, VecObject,
+};
 use soroban_env_host::Host;
 use std::os::raw::{c_int, c_void};
 
@@ -10,6 +12,8 @@ pub struct DispatchCtx {
     pub mem_size: u32,
     /// Mirrors ContractVM's relative object table for guest-visible handles.
     pub relative_objects: Vec<Val>,
+    /// Ordered host calls for profiling (fn_name, arg_count).
+    pub host_calls: Vec<(String, u16)>,
 }
 
 impl DispatchCtx {
@@ -20,6 +24,38 @@ impl DispatchCtx {
         }
         let slice = unsafe { std::slice::from_raw_parts(self.mem.add(pos as usize), len as usize) };
         Ok(slice.to_vec())
+    }
+
+    fn read_slice_descriptors(&self, pos: u32, len: u32) -> Result<Vec<(u32, u32)>, String> {
+        let nbytes = len as u64 * 8;
+        let end = pos as u64 + nbytes;
+        if end > self.mem_size as u64 {
+            return Err("guest slice descriptor oob".into());
+        }
+        let mut out = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let off = pos as usize + (i as usize * 8);
+            let mut buf = [0u8; 8];
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.mem.add(off), buf.as_mut_ptr(), 8);
+            }
+            let ptr = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+            let slen = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            out.push((ptr, slen));
+        }
+        Ok(out)
+    }
+
+    fn read_symbol_keys(&self, pos: u32, len: u32) -> Result<Vec<String>, String> {
+        let mut keys = Vec::with_capacity(len as usize);
+        for (ptr, slen) in self.read_slice_descriptors(pos, len)? {
+            let bytes = self.read_bytes(ptr, slen)?;
+            keys.push(
+                String::from_utf8(bytes)
+                    .map_err(|e| format!("symbol key utf8: {e}"))?,
+            );
+        }
+        Ok(keys)
     }
 
     fn read_vals(&self, pos: u32, len: u32) -> Result<Vec<Val>, String> {
@@ -39,6 +75,23 @@ impl DispatchCtx {
             out.push(self.to_absolute(val)?);
         }
         Ok(out)
+    }
+
+    fn write_vals(&mut self, pos: u32, vals: &[Val]) -> Result<(), String> {
+        let nbytes = vals.len() as u64 * 8;
+        let end = pos as u64 + nbytes;
+        if end > self.mem_size as u64 {
+            return Err("guest val write oob".into());
+        }
+        for (i, &v) in vals.iter().enumerate() {
+            let rel = self.to_relative(v)?;
+            let payload = rel.get_payload().to_le_bytes();
+            let off = pos as usize + i * 8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), self.mem.add(off), 8);
+            }
+        }
+        Ok(())
     }
 
     fn is_relative_handle(handle: u32) -> bool {
@@ -113,7 +166,6 @@ impl DispatchCtx {
     fn finish(&mut self, mb: &mut CuwasmMailbox, res: Option<Val>) -> Result<(), String> {
         match res {
             None => {
-                // Soroban wasm imports always have an i64 result slot, even for Void.
                 mb.n_results = 1;
                 let void_val: Val = ().into();
                 mb.results[0] = void_val.get_payload();
@@ -131,8 +183,14 @@ impl DispatchCtx {
         Ok(())
     }
 
+    fn finish_raw(&self, mb: &mut CuwasmMailbox, raw: u64) {
+        mb.n_results = 1;
+        mb.results[0] = raw;
+    }
+
     pub fn dispatch(&mut self, mb: &mut CuwasmMailbox) -> Result<(), String> {
         let name = env_ids::name(mb.fn_id).unwrap_or("?");
+        self.host_calls.push((name.to_string(), mb.n_args));
         let res: Option<Val> = match name {
             "string_new_from_linear_memory" => {
                 let pos = Self::decode_u32(mb.args[0])?;
@@ -142,6 +200,17 @@ impl DispatchCtx {
                     self.host
                         .string_new_from_slice(&bytes)
                         .map_err(|e| format!("string_new_from_slice: {e:?}"))?
+                        .into(),
+                )
+            }
+            "symbol_new_from_linear_memory" => {
+                let pos = Self::decode_u32(mb.args[0])?;
+                let len = Self::decode_u32(mb.args[1])?;
+                let bytes = self.read_bytes(pos, len)?;
+                Some(
+                    self.host
+                        .symbol_new_from_slice(&bytes)
+                        .map_err(|e| format!("symbol_new_from_slice: {e:?}"))?
                         .into(),
                 )
             }
@@ -155,6 +224,36 @@ impl DispatchCtx {
                         .map_err(|e| format!("vec_new_from_slice: {e:?}"))?
                         .into(),
                 )
+            }
+            "map_new_from_linear_memory" => {
+                let keys_pos = Self::decode_u32(mb.args[0])?;
+                let vals_pos = Self::decode_u32(mb.args[1])?;
+                let len = Self::decode_u32(mb.args[2])?;
+                let key_strs = self.read_symbol_keys(keys_pos, len)?;
+                let key_refs: Vec<&str> = key_strs.iter().map(|s| s.as_str()).collect();
+                let vals = self.read_vals(vals_pos, len)?;
+                Some(
+                    self.host
+                        .map_new_from_slices(&key_refs, &vals)
+                        .map_err(|e| format!("map_new_from_slices: {e:?}"))?
+                        .into(),
+                )
+            }
+            "map_unpack_to_linear_memory" => {
+                let map: MapObject = self.decode_val(mb.args[0])?.try_into().map_err(|_| {
+                    format!("map_unpack: arg0 not MapObject")
+                })?;
+                let keys_pos = Self::decode_u32(mb.args[1])?;
+                let vals_pos = Self::decode_u32(mb.args[2])?;
+                let len = Self::decode_u32(mb.args[3])?;
+                let key_strs = self.read_symbol_keys(keys_pos, len)?;
+                let key_refs: Vec<&str> = key_strs.iter().map(|s| s.as_str()).collect();
+                let mut vals = vec![Val::VOID.into(); len as usize];
+                self.host
+                    .map_unpack_to_slice(map, &key_refs, &mut vals)
+                    .map_err(|e| format!("map_unpack_to_slice: {e:?}"))?;
+                self.write_vals(vals_pos, &vals)?;
+                return self.finish(mb, None);
             }
             "has_contract_data" => {
                 let k = self.decode_val(mb.args[0])?;
@@ -184,12 +283,76 @@ impl DispatchCtx {
                     .map_err(|e| format!("put_contract_data: {e:?}"))?;
                 None
             }
+            "extend_contract_data_ttl" => {
+                let k = self.decode_val(mb.args[0])?;
+                let t = Self::decode_storage_type(mb.args[1])?;
+                let threshold: U32Val = Self::decode_u32(mb.args[2])?.into();
+                let extend_to: U32Val = Self::decode_u32(mb.args[3])?.into();
+                self.host
+                    .extend_contract_data_ttl(k, t, threshold, extend_to)
+                    .map_err(|e| format!("extend_contract_data_ttl: {e:?}"))?;
+                None
+            }
             "extend_current_contract_instance_and_code_ttl" => {
                 let threshold: U32Val = Self::decode_u32(mb.args[0])?.into();
                 let extend_to: U32Val = Self::decode_u32(mb.args[1])?.into();
                 self.host
                     .extend_current_contract_instance_and_code_ttl(threshold, extend_to)
                     .map_err(|e| format!("extend_current_contract_instance_and_code_ttl: {e:?}"))?;
+                None
+            }
+            "contract_event" => {
+                let topics: VecObject = self.decode_val(mb.args[0])?.try_into().map_err(|_| {
+                    format!("contract_event: topics not VecObject")
+                })?;
+                let data = self.decode_val(mb.args[1])?;
+                self.host
+                    .contract_event(topics, data)
+                    .map_err(|e| format!("contract_event: {e:?}"))?;
+                None
+            }
+            "get_ledger_sequence" => Some(
+                self.host
+                    .get_ledger_sequence()
+                    .map_err(|e| format!("get_ledger_sequence: {e:?}"))?
+                    .into(),
+            ),
+            "obj_from_i128_pieces" => {
+                let hi = mb.args[0] as i64;
+                let lo = mb.args[1];
+                Some(
+                    self.host
+                        .obj_from_i128_pieces(hi, lo)
+                        .map_err(|e| format!("obj_from_i128_pieces: {e:?}"))?
+                        .into(),
+                )
+            }
+            "obj_to_i128_lo64" => {
+                let obj = self.decode_val(mb.args[0])?;
+                let lo = self
+                    .host
+                    .obj_to_i128_lo64(obj.try_into().map_err(|_| "not I128Object")?)
+                    .map_err(|e| format!("obj_to_i128_lo64: {e:?}"))?;
+                self.finish_raw(mb, lo);
+                return Ok(());
+            }
+            "obj_to_i128_hi64" => {
+                let obj = self.decode_val(mb.args[0])?;
+                let hi = self
+                    .host
+                    .obj_to_i128_hi64(obj.try_into().map_err(|_| "not I128Object")?)
+                    .map_err(|e| format!("obj_to_i128_hi64: {e:?}"))?;
+                self.finish_raw(mb, hi as u64);
+                return Ok(());
+            }
+            "require_auth" => {
+                let addr: AddressObject = self
+                    .decode_val(mb.args[0])?
+                    .try_into()
+                    .map_err(|_| "require_auth: not AddressObject".to_string())?;
+                self.host
+                    .require_auth(addr)
+                    .map_err(|e| format!("require_auth: {e:?}"))?;
                 None
             }
             other => {

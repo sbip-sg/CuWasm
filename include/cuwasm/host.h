@@ -65,6 +65,7 @@ struct RunResult {
     std::string error;
 };
 
+
 struct HostCallContext {
     const HostModule* module = nullptr;
 };
@@ -80,7 +81,7 @@ std::string disasm(const HostModule& m);
 
 RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args,
                   uint32_t n_args, uint64_t max_steps = DEFAULT_MAX_STEPS,
-                  HostFn host_fn = default_host_fn);
+                  HostFn host_fn = default_host_fn, RunProfile* profile = nullptr);
 
 bool load_file(const std::string& path, std::vector<uint8_t>& out, std::string& err);
 

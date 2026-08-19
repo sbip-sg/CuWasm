@@ -153,7 +153,7 @@ bool parse_wast_assertions(const std::string& wast_path, std::vector<Assertion>&
 }
 
 RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32_t n_args,
-                  uint64_t max_steps, HostFn host_fn) {
+                  uint64_t max_steps, HostFn host_fn, RunProfile* profile) {
     RunResult r;
     if (func_idx >= m.funcs.size()) {
         r.status = ST_UNSUPPORTED_OP;
@@ -227,7 +227,7 @@ RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32
             break;
 
         run_instance(m.dev(), st, sv, fv, gptr, (uint32_t)m.globals.size(), mem, data, &mb,
-                     max_steps);
+                     max_steps, profile);
     }
 
     m.mem_size = st.mem_size;

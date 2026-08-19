@@ -1,0 +1,105 @@
+{
+  "contract": "soroban_hello_world_contract.wasm",
+  "scenarios": [
+    {
+      "export": "hello",
+      "host_calls": [
+        {
+          "name": "string_new_from_linear_memory",
+          "arg_count": 2,
+          "count": 1
+        },
+        {
+          "name": "vec_new_from_linear_memory",
+          "arg_count": 2,
+          "count": 1
+        }
+      ],
+      "host_calls_total": 2,
+      "opcodes": [
+        {
+          "op": "local.get",
+          "count": 31
+        },
+        {
+          "op": "i64.const",
+          "count": 30
+        },
+        {
+          "op": "i32.add",
+          "count": 16
+        },
+        {
+          "op": "local.set",
+          "count": 9
+        },
+        {
+          "op": "br",
+          "count": 7
+        },
+        {
+          "op": "br_if_not",
+          "count": 7
+        },
+        {
+          "op": "store",
+          "count": 6
+        },
+        {
+          "op": "i32.eq",
+          "count": 3
+        },
+        {
+          "op": "i32.ne",
+          "count": 3
+        },
+        {
+          "op": "i64.or",
+          "count": 2
+        },
+        {
+          "op": "i64.shl",
+          "count": 2
+        },
+        {
+          "op": "i64.extend_i32_u",
+          "count": 2
+        },
+        {
+          "op": "global.set",
+          "count": 2
+        },
+        {
+          "op": "load",
+          "count": 2
+        },
+        {
+          "op": "call_host",
+          "count": 2
+        },
+        {
+          "op": "return",
+          "count": 1
+        },
+        {
+          "op": "i32.sub",
+          "count": 1
+        },
+        {
+          "op": "i64.ne",
+          "count": 1
+        },
+        {
+          "op": "i64.and",
+          "count": 1
+        },
+        {
+          "op": "global.get",
+          "count": 1
+        }
+      ],
+      "opcodes_total": 129,
+      "unsupported_opcodes": []
+    }
+  ]
+}

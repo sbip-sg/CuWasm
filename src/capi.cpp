@@ -1,9 +1,12 @@
 #include "cuwasm/capi.h"
+#include "cuwasm/cuop.h"
 #include "cuwasm/host.h"
 
 #include <cstring>
 #include <new>
 #include <string>
+
+static_assert(cuwasm::CUWASM_OP_COUNT == CUWASM_CAPI_OP_COUNT, "opcode count mismatch");
 
 struct CuwasmModule {
     cuwasm::HostModule m;
@@ -96,13 +99,22 @@ extern "C" uint32_t cuwasm_module_memory_size(CuwasmModule* m) {
 
 extern "C" int cuwasm_module_run(CuwasmModule* m, uint32_t func_idx, const uint64_t* args,
                                  uint32_t n_args, uint64_t max_steps, CuwasmHostFn host, void* ctx,
-                                 CuwasmRunResult* out) {
+                                 CuwasmRunResult* out, CuwasmRunProfile* profile) {
     if (!m || !out)
         return -1;
     RunCtx rc{host, ctx, &m->m};
     g_run_ctx = &rc;
-    auto r = cuwasm::run_cpu(m->m, func_idx, args, n_args, max_steps, capi_host_bridge);
+    cuwasm::RunProfile rp{};
+    cuwasm::RunProfile* rp_ptr = profile ? &rp : nullptr;
+    auto r = cuwasm::run_cpu(m->m, func_idx, args, n_args, max_steps, capi_host_bridge, rp_ptr);
     g_run_ctx = nullptr;
+    if (profile) {
+        for (uint32_t i = 0; i < CUWASM_CAPI_OP_COUNT; ++i) {
+            profile->opcode_counts[i] = rp.opcode_counts[i];
+            profile->unsupported_opcode_counts[i] = rp.unsupported_opcode_counts[i];
+        }
+        profile->total_ops = rp.total_ops;
+    }
     out->status = r.status;
     out->n_results = (uint32_t)r.results.size();
     for (size_t i = 0; i < r.results.size() && i < 8; ++i)

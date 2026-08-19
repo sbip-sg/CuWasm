@@ -88,6 +88,14 @@ enum CuOpcode : uint16_t {
     OP_CLZ,
 };
 
+static constexpr uint16_t CUWASM_OP_COUNT = static_cast<uint16_t>(OP_CLZ) + 1u;
+
+struct RunProfile {
+    uint64_t opcode_counts[CUWASM_OP_COUNT]{};
+    uint64_t unsupported_opcode_counts[CUWASM_OP_COUNT]{};
+    uint64_t total_ops = 0;
+};
+
 struct alignas(8) CuOp {
     uint16_t op;
     uint16_t a;

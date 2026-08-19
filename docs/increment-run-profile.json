@@ -1,0 +1,111 @@
+{
+  "contract": "soroban_increment_contract.wasm",
+  "scenarios": [
+    {
+      "export": "increment",
+      "host_calls": [
+        {
+          "name": "extend_current_contract_instance_and_code_ttl",
+          "arg_count": 2,
+          "count": 2
+        },
+        {
+          "name": "get_contract_data",
+          "arg_count": 2,
+          "count": 1
+        },
+        {
+          "name": "has_contract_data",
+          "arg_count": 2,
+          "count": 2
+        },
+        {
+          "name": "put_contract_data",
+          "arg_count": 3,
+          "count": 2
+        }
+      ],
+      "host_calls_total": 7,
+      "opcodes": [
+        {
+          "op": "i64.const",
+          "count": 24
+        },
+        {
+          "op": "local.get",
+          "count": 17
+        },
+        {
+          "op": "local.set",
+          "count": 10
+        },
+        {
+          "op": "call_host",
+          "count": 7
+        },
+        {
+          "op": "br_if_not",
+          "count": 5
+        },
+        {
+          "op": "drop",
+          "count": 4
+        },
+        {
+          "op": "i64.ne",
+          "count": 3
+        },
+        {
+          "op": "call",
+          "count": 2
+        },
+        {
+          "op": "return",
+          "count": 2
+        },
+        {
+          "op": "end",
+          "count": 2
+        },
+        {
+          "op": "i32.eqz",
+          "count": 2
+        },
+        {
+          "op": "i32.add",
+          "count": 2
+        },
+        {
+          "op": "i64.or",
+          "count": 2
+        },
+        {
+          "op": "i64.shl",
+          "count": 2
+        },
+        {
+          "op": "i64.extend_i32_u",
+          "count": 2
+        },
+        {
+          "op": "br",
+          "count": 1
+        },
+        {
+          "op": "i32.wrap_i64",
+          "count": 1
+        },
+        {
+          "op": "i64.and",
+          "count": 1
+        },
+        {
+          "op": "i64.shr_u",
+          "count": 1
+        }
+      ],
+      "opcodes_total": 90,
+      "unsupported_opcodes": []
+    }
+  ]
+}

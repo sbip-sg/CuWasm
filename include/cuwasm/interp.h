@@ -30,7 +30,7 @@ HD void mul_wide_s(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi) {
 template <class StackV, class FrameV>
 HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames,
                      uint64_t* globals, uint32_t n_globals, MemView mem, DataView data,
-                     HostMailbox* mb, uint64_t max_steps) {
+                     HostMailbox* mb, uint64_t max_steps, RunProfile* profile = nullptr) {
     uint32_t pc = st.pc, sp = st.sp, fp = st.fp, csp = st.csp;
     int64_t fuel = st.fuel;
     uint32_t peak_csp = st.peak_csp;
@@ -53,6 +53,12 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
         if (pc >= m.code_len)
             TRAP(ST_TRAP_UNREACHABLE);
         const CuOp in = m.code[pc++];
+        if (profile) {
+            if (in.op < CUWASM_OP_COUNT) {
+                profile->opcode_counts[in.op]++;
+                profile->total_ops++;
+            }
+        }
         switch (in.op) {
         case OP_I64_CONST:
             CU_PUSH(m.consts[in.b]);
@@ -689,6 +695,8 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
         }
 
         default:
+            if (profile && in.op < CUWASM_OP_COUNT)
+                profile->unsupported_opcode_counts[in.op]++;
             TRAP(ST_UNSUPPORTED_OP);
         }
         if (sp > STACK_CAP)
