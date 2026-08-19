@@ -1,0 +1,26 @@
+[package]
+name = "cuwasm-tools"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cuwasm_translate"
+crate-type = ["staticlib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuwasm-oracle"
+path = "src/bin/oracle.rs"
+
+[[bin]]
+name = "wastprep"
+path = "src/bin/wastprep.rs"
+
+[dependencies]
+wasmparser = "0.227"
+wat = "1.227"
+wast = "227"
+wasmi = "0.47"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"

@@ -1,0 +1,5 @@
+/build/
+/tools/target/
+.idea/
+.vscode/
+*.user
