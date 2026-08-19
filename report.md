@@ -285,7 +285,7 @@ Each CUDA thread runs a fully independent contract instance with private:
 - **Stack** (512 slots × 8 B = 4 KB)
 - **Frame buffer** (64 frames × 16 B = 1 KB)
 - **Globals** (3 × 8 B = 24 B)
-- **WASM linear memory** (1 MB per thread, full copy)
+- **WASM linear memory** (1 MB per thread — see note below)
 - **GPU-side K/V storage** (`GpuStorage`, 16 entries × 24 B + header = 392 B)
 
 No state is shared between threads. Each instance can (and does) mutate its own memory, globals, and storage independently.
@@ -299,6 +299,32 @@ Host functions are handled **entirely on-GPU** via `gpu_host_dispatch()` (`inclu
 CUDA events (`cudaEventRecord`) measure kernel time only, excluding H2D/D2H memory transfers.
 
 **TPS = N_completed / kernel_seconds**, where N_completed is the number of threads that reached `ST_OK`.
+
+### Why 1 MB per thread?
+
+The 1 MB comes from each contract's **WASM memory section `min_pages` declaration**:
+
+| Contract | min_pages | Bytes per thread |
+|---|---:|---:|
+| `soroban_hello_world_contract.wasm` | 17 | 1,114,112 B (~1.06 MB) |
+| `soroban_increment_contract.wasm` | 16 | 1,048,576 B (1.00 MB) |
+| `soroban_token_contract.wasm` | 17 | 1,114,112 B (~1.06 MB) |
+
+This is the Stellar Rust SDK's default allocation — all SDK-compiled contracts reserve 16–17 pages upfront. CuWASM copies only `mem_size = min_pages × 65536` bytes per thread (not the full 64 MB backing buffer). The size cannot be reduced without recompiling the contract with a smaller initial memory.
+
+**Is it configurable?** Yes, at the contract-compilation level: a contract author could pass `--initial-memory=N` to the linker to use fewer pages. CuWASM would then allocate fewer bytes per thread automatically (it uses `hm.mem_size` which tracks `min_pages × 65536`). For these Soroban SDK contracts the minimum is fixed at 16–17 pages.
+
+### Why only `increment` is benchmarked here
+
+The `hello` and `token` contracts require **Soroban object handles** as arguments:
+- `hello(to: Vec<Symbol>)` — the `to` arg is a `VecObject`, a heap-allocated host object
+- `token::balance(id: Address)` — the `id` arg is an `AddressObject`
+
+These handles are created by the host (`host.string_new_from_slice(...)`, `host.vec_new_from_slice(...)`) and reference entries in the host's object heap. Without a host context on the GPU, there is no valid object heap, so any handle passed will fail the contract's own inline tag-check (triggering `trap_unreachable`).
+
+`increment()` takes **zero arguments** — it only reads/writes its own storage — which is why it works end-to-end with the GPU K/V simulation.
+
+Extending to `token` would require adding a per-thread GPU object heap (strings, vecs, addresses) to `gpu_host.h`. This is future work.
 
 ### Hardware
 
@@ -349,9 +375,21 @@ Smaller blocks (32–64) are optimal because the switch-based interpreter has hi
 
 At N=16384, per-thread memory is 1,006 KB (dominated by the 1 MB WASM linear memory image), totaling ~16.1 GB out of 20 GB available. This is the practical limit for this GPU; higher N requires either a GPU with more memory or a contract with a smaller initial memory footprint.
 
+### Compute sanitizer results
+
+`compute-sanitizer` was run on the `increment` benchmark (N=256, block_size=64) to check for memory safety issues:
+
+```
+compute-sanitizer --tool memcheck  build/bench ... → ERROR SUMMARY: 0 errors
+compute-sanitizer --tool racecheck build/bench ... → RACECHECK SUMMARY: 0 hazards (0 errors, 0 warnings)
+compute-sanitizer --tool initcheck build/bench ... → ERROR SUMMARY: 0 errors
+```
+
+No out-of-bounds accesses, race conditions, or reads from uninitialized memory. Each thread's private arrays (stack, frames, globals, memory, storage) are indexed by `tid × stride` and never overlap.
+
 ### Possible future optimizations
 
-1. **Heavier contract benchmarks**: token contract with realistic constructor + mint + transfer flows, to measure TPS on a more representative workload.
+1. **GPU object heap**: implement per-thread heap for Soroban object types (strings, vecs, addresses, i128) in `gpu_host.h` to enable benchmarking `hello` and `token` contracts.
 2. **SoA memory layout**: transform per-thread arrays from Array-of-Structs to Struct-of-Arrays for better memory coalescing.
 3. **Persistent-thread kernel**: amortize kernel launch overhead by having threads process multiple contract instances in sequence.
-4. **Reduced linear memory**: contracts that only use a small fraction of their initial pages could use demand-paging or compressed memory.
+4. **Reduced linear memory**: contracts that only use a small fraction of their initial pages could use demand-paging or compressed memory; this would directly reduce VRAM usage and allow more threads.
