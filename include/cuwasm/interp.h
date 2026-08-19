@@ -43,7 +43,7 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
     } while (0)
 #define CU_PUSH(v)                                                             \
     do {                                                                       \
-        if (sp >= STACK_CAP)                                                   \
+        if (sp >= stack.cap)                                                   \
             TRAP(ST_TRAP_STACK_OVERFLOW);                                      \
         stack.at(sp++) = (uint64_t)(v);                                        \
     } while (0)

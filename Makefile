@@ -33,7 +33,7 @@ emit-profiles: $(RUSTLIB)
 CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp src/capi.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
-.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike spec-suite spec-catalog
+.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike spec-suite spec-catalog bench
 
 all: $(BUILD)/cuwasm-run $(BUILD)/test_cpu
 
@@ -96,6 +96,10 @@ $(BUILD)/test_cpu: $(TEST_SRCS) $(RUSTLIB)
 	mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) -o $@ $(TEST_SRCS) $(RUSTLIB) $(RUST_LIBS)
 
+$(BUILD)/bench: src/bench.cu $(CPU_SRCS) $(RUSTLIB)
+	mkdir -p $(BUILD)
+	$(NVCC) $(NVCCFLAGS) -o $@ src/bench.cu $(CPU_SRCS) $(RUSTLIB) $(RUST_LIBS)
+
 $(BUILD)/cuwasm-run-gpu: src/runner.cu $(CPU_SRCS) $(RUSTLIB)
 	mkdir -p $(BUILD)
 	$(NVCC) $(NVCCFLAGS) -DCUWASM_GPU_MAIN -o $@ src/runner.cu $(CPU_SRCS) $(RUSTLIB) $(RUST_LIBS)
@@ -117,6 +121,20 @@ HOST_SPIKE := tools/host-spike/Cargo.toml
 test-host-spike:
 	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/host-spike cargo test --manifest-path $(HOST_SPIKE)
 	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/host-spike cargo run --release --manifest-path $(HOST_SPIKE)
+
+HELLO_WASM  := contracts/wasm/soroban_hello_world_contract.wasm
+INCREMENT_WASM := contracts/wasm/soroban_increment_contract.wasm
+TOKEN_WASM  := contracts/wasm/soroban_token_contract.wasm
+BENCH_N     ?= 8192
+BENCH_BS    ?= 256
+
+bench: $(BUILD)/bench
+	@echo "=== hello hello ($(BENCH_N) threads) ==="
+	$(BUILD)/bench $(HELLO_WASM)     hello     $(BENCH_N) $(BENCH_BS)
+	@echo "=== increment increment ($(BENCH_N) threads) ==="
+	$(BUILD)/bench $(INCREMENT_WASM) increment $(BENCH_N) $(BENCH_BS)
+	@echo "=== token balance ($(BENCH_N) threads) ==="
+	$(BUILD)/bench $(TOKEN_WASM)     balance   $(BENCH_N) $(BENCH_BS)
 
 clean:
 	rm -rf $(BUILD)
