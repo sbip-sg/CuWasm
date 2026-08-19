@@ -17,7 +17,7 @@ RUST_LIBS := -ldl -lpthread -lm -lgcc_s
 CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
-.PHONY: all verify test-cpu test-gpu prep tools clean suite
+.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike
 
 all: $(BUILD)/cuwasm-run $(BUILD)/test_cpu
 
@@ -79,6 +79,11 @@ test-gpu: prep $(BUILD)/test_gpu
 
 verify: test-cpu test-gpu
 	@echo "verify ok"
+
+HOST_SPIKE := tools/host-spike/Cargo.toml
+test-host-spike:
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/host-spike cargo test --manifest-path $(HOST_SPIKE)
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/host-spike cargo run --release --manifest-path $(HOST_SPIKE)
 
 clean:
 	rm -rf $(BUILD)
