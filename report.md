@@ -423,9 +423,33 @@ compute-sanitizer --tool initcheck build/bench ... → ERROR SUMMARY: 0 errors
 
 No out-of-bounds accesses, race conditions, or reads from uninitialized memory. Each thread's private arrays (stack, frames, globals, memory, host state) are indexed by `tid × stride` and never overlap.
 
+### `token::transfer` — investigation and current limitation
+
+`transfer(from: Address, to: Address, amount: i128)` was investigated as a more realistic workload than `balance`.
+
+**What transfer does** (~3,000 opcodes per invocation):
+1. Validates `amount` is a non-negative `I128Object`
+2. Verifies `from` is authorized (`require_auth`)
+3. Reads admin key from K/V storage, checks it matches the caller
+4. Reads `from` balance (or 0), subtracts `amount`, writes new balance
+5. Reads `to` balance (or 0), adds `amount`, writes new balance
+6. Emits a contract event (5 host calls total)
+
+**The storage key problem:**
+The token contract uses `vec_new_from_linear_memory` to build composite keys for storage entries (e.g., `[address_bytes]`). The returned `VecObject` handle (e.g., `0x14b`, `0x24b`) becomes the raw key stored in the per-thread `GpuStorage`. Because object handles are sequential allocation counters, the same address bytes produce a different handle in each contract invocation. The GPU simulation compares K/V keys by raw 64-bit Val (including the handle index), so keys written by `mint` cannot be found by `transfer` — they produce different handle indices due to different allocation histories.
+
+In the real Soroban host, object comparison is content-based (the host dereferences handles and compares bytes). Our GPU simulation omits this because the object heap only stores opaque byte data without a reverse-lookup by content.
+
+**To fully support `transfer` in the GPU benchmark**, the GPU object heap would need content-based key comparison: when `has/get/put_contract_data` are called with a `VecObject` key, the GPU must look up the Vec's byte content and match it against previously stored entries by value rather than by handle number. This is implementable but would significantly increase per-thread memory usage and dispatch complexity.
+
+**For now**, `transfer` is supported end-to-end in the CPU-side correctness test (`test_token`: `mint → balance → transfer → balance`) but cannot be benchmarked in isolation on the GPU without content-based object comparison. The `token::balance` benchmark (~22 M TPS at N=16,384) remains the most realistic GPU throughput figure available.
+
+---
+
 ### Possible future optimizations
 
 1. **SoA memory layout**: transform per-thread arrays from Array-of-Structs to Struct-of-Arrays for better memory coalescing.
 2. **Persistent-thread kernel**: amortize kernel launch overhead by having threads process multiple contract instances in sequence.
 3. **Reduced linear memory**: contracts using only a small fraction of their initial pages could use demand-paging or compressed layouts to reduce VRAM usage and allow more threads.
 4. **Speculative object handles**: pre-allocate a deterministic handle assignment so all threads in a warp follow the same branch path (reduces warp divergence in tag-check code).
+5. **Content-based object comparison in GpuStorage**: store Vec/Map/Address byte content alongside handles so `has/get/put` can match keys across invocations, enabling `token::transfer` benchmarks.

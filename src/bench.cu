@@ -99,8 +99,12 @@ static bool cuda_check(cudaError_t e, const char* what) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: bench <module.wasm> <export> [n_threads=%d] [block_size=%d] [i64args...]\n",
-            8192, 256);
+            "usage: bench <module.wasm> <export> [n_threads] [block_size] [args...]\n"
+            "             [--store key=val ...] [--obj tag:lo64:hi64 ...]\n"
+            "  args: hex i64 values passed to the export\n"
+            "  --store: pre-seed per-thread K/V storage with key=val (both hex)\n"
+            "  --obj: pre-allocate an object in the GPU heap (tag,lo,hi all hex)\n"
+            "         allocates handles 0,1,2... in order given\n");
         return 2;
     }
     const char* wasm_path = argv[1];
@@ -109,9 +113,47 @@ int main(int argc, char** argv) {
     int block_size  = argc > 4 ? std::atoi(argv[4]) : 256;
     int n_blocks    = (n_threads + block_size - 1) / block_size;
 
+    // Parse args, --store k=v, and --obj tag:lo:hi
     std::vector<uint64_t> call_args;
-    for (int i = 5; i < argc; ++i)
-        call_args.push_back((uint64_t)std::strtoll(argv[i], nullptr, 16));
+    // Storage pre-seeds
+    struct StoreSeed { uint64_t key, val; };
+    std::vector<StoreSeed> store_seeds;
+    // Object heap pre-seeds
+    struct ObjSeed { uint8_t tag; uint64_t lo, hi; };
+    std::vector<ObjSeed> obj_seeds;
+
+    for (int i = 5; i < argc; ++i) {
+        const char* a = argv[i];
+        if (std::strcmp(a, "--store") == 0) {
+            ++i;
+            while (i < argc && argv[i][0] != '-') {
+                uint64_t k = 0, v = 0;
+                const char* eq = std::strchr(argv[i], '=');
+                if (eq) {
+                    k = (uint64_t)std::strtoull(argv[i], nullptr, 16);
+                    v = (uint64_t)std::strtoull(eq + 1, nullptr, 16);
+                }
+                store_seeds.push_back({k, v});
+                ++i;
+            }
+            --i;
+        } else if (std::strcmp(a, "--obj") == 0) {
+            ++i;
+            while (i < argc && argv[i][0] != '-') {
+                // format: tag:lo:hi (all hex)
+                uint64_t tag = 0, lo = 0, hi = 0;
+                char* end;
+                tag = std::strtoull(argv[i], &end, 16);
+                if (*end == ':') { lo = std::strtoull(end+1, &end, 16); }
+                if (*end == ':') { hi = std::strtoull(end+1, nullptr, 16); }
+                obj_seeds.push_back({(uint8_t)tag, lo, hi});
+                ++i;
+            }
+            --i;
+        } else {
+            call_args.push_back((uint64_t)std::strtoull(a, nullptr, 16));
+        }
+    }
 
     std::string err;
     std::vector<uint8_t> wasm_bytes;
@@ -292,8 +334,27 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> h_l((size_t)n_threads * n_data, 1);
             cudaMemcpy(d_lives, h_l.data(), per_lives, cudaMemcpyHostToDevice);
         }
-        // Zero-init all per-thread host states (empty object heap + storage)
+        // Zero-init all per-thread host states, then apply pre-seeds
         cudaMemset(d_host_states, 0, per_hstates);
+        if (!store_seeds.empty() || !obj_seeds.empty()) {
+            // Build a template GpuHostState and upload it to each thread
+            cuwasm::GpuHostState tmpl{};
+            for (auto& s : obj_seeds) {
+                if (tmpl.obj_heap.count >= cuwasm::GPU_OBJ_CAP) break;
+                auto& e = tmpl.obj_heap.entries[tmpl.obj_heap.count++];
+                e.tag = s.tag; e.len = 16;
+                for (int j = 0; j < 8; ++j) e.data[j]   = (uint8_t)(s.lo >> (8*j));
+                for (int j = 0; j < 8; ++j) e.data[8+j] = (uint8_t)(s.hi >> (8*j));
+            }
+            for (auto& s : store_seeds) {
+                if (tmpl.storage.count >= cuwasm::GPU_STORAGE_CAP) break;
+                auto& e = tmpl.storage.entries[tmpl.storage.count++];
+                e.key = s.key; e.val = s.val; e.occupied = 1;
+            }
+            // Upload template to all threads
+            std::vector<cuwasm::GpuHostState> h_hs(n_threads, tmpl);
+            cudaMemcpy(d_host_states, h_hs.data(), per_hstates, cudaMemcpyHostToDevice);
+        }
     };
 
     auto launch = [&]() {
