@@ -17,11 +17,11 @@ RUST_LIBS := -ldl -lpthread -lm -lgcc_s
 CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
-.PHONY: all verify test-cpu test-gpu prep tools clean
+.PHONY: all verify test-cpu test-gpu prep tools clean suite
 
 all: $(BUILD)/cuwasm-run $(BUILD)/test_cpu
 
-$(RUSTLIB): tools/src/lib.rs tools/src/bin/oracle.rs tools/src/bin/wastprep.rs tools/Cargo.toml
+$(RUSTLIB): tools/src/lib.rs tools/src/bin/oracle.rs tools/src/bin/wastprep.rs tools/src/bin/wast-catalog.rs tools/Cargo.toml
 	mkdir -p $(BUILD)
 	$(CARGO_TIMEOUT) env CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo build --release --manifest-path $(TOOLS_MANIFEST)
 
@@ -31,6 +31,25 @@ $(ORACLE): $(RUSTLIB)
 	cp -f $(CARGO_TARGET_DIR)/release/wastprep $(WASTPREP)
 
 $(WASTPREP): $(ORACLE)
+
+$(BUILD)/wast-catalog: $(RUSTLIB)
+	mkdir -p $(BUILD)
+	cp -f $(CARGO_TARGET_DIR)/release/wast-catalog $(BUILD)/wast-catalog
+
+SUITE_ROOT ?= tests/wasmi-tests
+SUITE_OUT := $(BUILD)/suite
+
+$(SUITE_OUT)/catalog.jsonl: $(BUILD)/wast-catalog
+	mkdir -p $(SUITE_OUT)
+	$(TIMEOUT) $(BUILD)/wast-catalog $(SUITE_ROOT) $(SUITE_OUT)
+
+$(BUILD)/test_suite: tests/test_suite.cpp $(CPU_SRCS) $(RUSTLIB)
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ tests/test_suite.cpp $(CPU_SRCS) $(RUSTLIB) $(RUST_LIBS)
+
+.PHONY: suite
+suite: $(SUITE_OUT)/catalog.jsonl $(BUILD)/test_suite
+	$(TIMEOUT) $(BUILD)/test_suite $(SUITE_OUT)/catalog.jsonl $(SUITE_OUT)
 
 prep: $(ORACLE)
 	mkdir -p $(GEN)

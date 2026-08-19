@@ -16,6 +16,10 @@ path = "src/bin/oracle.rs"
 name = "wastprep"
 path = "src/bin/wastprep.rs"
 
+[[bin]]
+name = "wast-catalog"
+path = "src/bin/wast-catalog.rs"
+
 [dependencies]
 wasmparser = "0.227"
 wat = "1.227"
