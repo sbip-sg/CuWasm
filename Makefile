@@ -14,7 +14,11 @@ ORACLE := $(BUILD)/cuwasm-oracle
 WASTPREP := $(BUILD)/wastprep
 RUST_LIBS := -ldl -lpthread -lm -lgcc_s
 
-CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp
+.PHONY: test-hello-world test-contract-tests
+test-hello-world test-contract-tests: $(RUSTLIB)
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml -- --nocapture
+
+CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp src/capi.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
 .PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike spec-suite spec-catalog
