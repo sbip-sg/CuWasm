@@ -17,7 +17,7 @@ RUST_LIBS := -ldl -lpthread -lm -lgcc_s
 CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
-.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike
+.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike spec-suite spec-catalog
 
 all: $(BUILD)/cuwasm-run $(BUILD)/test_cpu
 
@@ -41,7 +41,7 @@ SUITE_OUT := $(BUILD)/suite
 
 $(SUITE_OUT)/catalog.jsonl: $(BUILD)/wast-catalog
 	mkdir -p $(SUITE_OUT)
-	$(TIMEOUT) $(BUILD)/wast-catalog $(SUITE_ROOT) $(SUITE_OUT)
+	$(TIMEOUT) $(BUILD)/wast-catalog $(SUITE_ROOT) $(SUITE_OUT) tests/spec
 
 $(BUILD)/test_suite: tests/test_suite.cpp $(CPU_SRCS) $(RUSTLIB)
 	mkdir -p $(BUILD)
@@ -50,6 +50,19 @@ $(BUILD)/test_suite: tests/test_suite.cpp $(CPU_SRCS) $(RUSTLIB)
 .PHONY: suite
 suite: $(SUITE_OUT)/catalog.jsonl $(BUILD)/test_suite
 	$(TIMEOUT) $(BUILD)/test_suite $(SUITE_OUT)/catalog.jsonl $(SUITE_OUT)
+
+SPEC_ROOT := tests/spec
+SPEC_OUT := $(BUILD)/spec-suite
+
+$(SPEC_OUT)/catalog.jsonl: $(BUILD)/wast-catalog $(wildcard tests/spec/*.wast)
+	mkdir -p $(SPEC_OUT)
+	$(TIMEOUT) $(BUILD)/wast-catalog $(SPEC_ROOT) $(SPEC_OUT)
+
+.PHONY: spec-catalog spec-suite
+spec-catalog: $(SPEC_OUT)/catalog.jsonl
+
+spec-suite: $(SPEC_OUT)/catalog.jsonl $(BUILD)/test_suite
+	$(TIMEOUT) $(BUILD)/test_suite $(SPEC_OUT)/catalog.jsonl $(SPEC_OUT)
 
 prep: $(ORACLE)
 	mkdir -p $(GEN)

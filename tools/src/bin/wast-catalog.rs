@@ -52,60 +52,37 @@ fn ret_core(r: &WastRet<'_>) -> Result<(u64, &'static str), String> {
     }
 }
 
-fn wasm_has_import(bytes: &[u8]) -> bool {
-    if bytes.len() < 8 {
-        return false;
-    }
-    let mut i = 8usize;
-    while i + 1 < bytes.len() {
-        let id = bytes[i];
-        i += 1;
-        let mut n = 0u32;
-        let mut shift = 0;
-        loop {
-            if i >= bytes.len() {
-                return false;
-            }
-            let b = bytes[i];
-            i += 1;
-            n |= ((b & 0x7f) as u32) << shift;
-            if b & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 28 {
-                return false;
-            }
-        }
-        if id == 2 && n > 0 {
-            return true;
-        }
-        if i + n as usize > bytes.len() {
-            return false;
-        }
-        i += n as usize;
-    }
-    false
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: wast-catalog <wast-root> <out-dir>");
+    if args.len() < 3 {
+        eprintln!("usage: wast-catalog <wast-root> <out-dir> [extra-root...]");
         std::process::exit(2);
     }
     let root = PathBuf::from(&args[1]);
     let out = PathBuf::from(&args[2]);
+    let extra: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
     let wasm_dir = out.join("wasm");
     fs::create_dir_all(&wasm_dir).unwrap();
 
-    let files = walk_wast(&root);
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for p in walk_wast(&root) {
+        let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+        files.push((rel, p));
+    }
+    for er in extra.iter() {
+        let prefix = er.file_name().and_then(|s| s.to_str()).unwrap_or("extra");
+        for p in walk_wast(er) {
+            let rel = p.strip_prefix(er).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            files.push((format!("{prefix}/{rel}"), p));
+        }
+    }
     let mut cases: Vec<Case> = Vec::new();
     let mut wasm_n = 0u32;
     let mut parse_fail = 0u32;
 
-    for path in &files {
-        let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+    for (rel, path) in &files {
+        let rel = rel.clone();
         let src = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -168,16 +145,13 @@ fn main() {
                 WastDirective::Module(mut m) | WastDirective::ModuleDefinition(mut m) => {
                     match m.encode() {
                         Ok(bytes) => {
-                            if wasm_has_import(&bytes) {
-                                current_wasm = None;
-                                current_skip = Some("import".into());
-                            } else {
-                                wasm_n += 1;
-                                let name = format!("{wasm_n:05}.wasm");
-                                fs::write(wasm_dir.join(&name), &bytes).unwrap();
-                                current_wasm = Some(format!("wasm/{name}"));
-                                current_skip = None;
-                            }
+                            // Import modules stay runnable: the translator must reject them
+                            // loudly (unsupported), not the catalog (skip).
+                            wasm_n += 1;
+                            let name = format!("{wasm_n:05}.wasm");
+                            fs::write(wasm_dir.join(&name), &bytes).unwrap();
+                            current_wasm = Some(format!("wasm/{name}"));
+                            current_skip = None;
                         }
                         Err(e) => {
                             current_wasm = None;
@@ -279,20 +253,41 @@ fn main() {
                     });
                 }
                 WastDirective::AssertTrap { exec, .. } => {
-                    let WastExecute::Invoke(inv) = exec else {
-                        cases.push(Case {
-                            kind: "skip".into(),
-                            file: rel.clone(),
-                            export: String::new(),
-                            wasm: String::new(),
-                            skip: "non-invoke assert_trap".into(),
-                            args: vec![],
-                            arg_ty: vec![],
-                            expected: vec![],
-                            exp_ty: vec![],
-                        });
-                        continue;
-                    };
+                    match exec {
+                        WastExecute::Wat(mut wat) => {
+                            match wat.encode() {
+                                Ok(bytes) => {
+                                    wasm_n += 1;
+                                    let name = format!("{wasm_n:05}.wasm");
+                                    fs::write(wasm_dir.join(&name), &bytes).unwrap();
+                                    cases.push(Case {
+                                        kind: "unlinkable".into(),
+                                        file: rel.clone(),
+                                        export: String::new(),
+                                        wasm: format!("wasm/{name}"),
+                                        skip: String::new(),
+                                        args: vec![],
+                                        arg_ty: vec![],
+                                        expected: vec![],
+                                        exp_ty: vec![],
+                                    });
+                                }
+                                Err(e) => {
+                                    cases.push(Case {
+                                        kind: "skip".into(),
+                                        file: rel.clone(),
+                                        export: String::new(),
+                                        wasm: String::new(),
+                                        skip: format!("instantiate-trap encode: {e}"),
+                                        args: vec![],
+                                        arg_ty: vec![],
+                                        expected: vec![],
+                                        exp_ty: vec![],
+                                    });
+                                }
+                            }
+                        }
+                        WastExecute::Invoke(inv) => {
                     if let Some(reason) = &current_skip {
                         cases.push(Case {
                             kind: "skip".into(),
@@ -358,10 +353,57 @@ fn main() {
                         expected: vec![],
                         exp_ty: vec![],
                     });
+                        }
+                        _ => {
+                            cases.push(Case {
+                                kind: "skip".into(),
+                                file: rel.clone(),
+                                export: String::new(),
+                                wasm: String::new(),
+                                skip: "non-invoke assert_trap".into(),
+                                args: vec![],
+                                arg_ty: vec![],
+                                expected: vec![],
+                                exp_ty: vec![],
+                            });
+                        }
+                    }
+                }
+                WastDirective::AssertUnlinkable { mut module, .. } => {
+                    match module.encode() {
+                        Ok(bytes) => {
+                            wasm_n += 1;
+                            let name = format!("{wasm_n:05}.wasm");
+                            fs::write(wasm_dir.join(&name), &bytes).unwrap();
+                            cases.push(Case {
+                                kind: "unlinkable".into(),
+                                file: rel.clone(),
+                                export: String::new(),
+                                wasm: format!("wasm/{name}"),
+                                skip: String::new(),
+                                args: vec![],
+                                arg_ty: vec![],
+                                expected: vec![],
+                                exp_ty: vec![],
+                            });
+                        }
+                        Err(e) => {
+                            cases.push(Case {
+                                kind: "skip".into(),
+                                file: rel.clone(),
+                                export: String::new(),
+                                wasm: String::new(),
+                                skip: format!("unlinkable encode: {e}"),
+                                args: vec![],
+                                arg_ty: vec![],
+                                expected: vec![],
+                                exp_ty: vec![],
+                            });
+                        }
+                    }
                 }
                 WastDirective::AssertInvalid { .. }
                 | WastDirective::AssertMalformed { .. }
-                | WastDirective::AssertUnlinkable { .. }
                 | WastDirective::AssertExhaustion { .. }
                 | WastDirective::AssertException { .. }
                 | WastDirective::AssertSuspension { .. } => {
@@ -384,9 +426,15 @@ fn main() {
 
     let jsonl = out.join("catalog.jsonl");
     let mut body = String::new();
+    let mut kinds: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    let mut runnable_by_file: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     for c in &cases {
         body.push_str(&serde_json::to_string(c).unwrap());
         body.push('\n');
+        *kinds.entry(c.kind.clone()).or_insert(0) += 1;
+        if c.kind != "skip" {
+            *runnable_by_file.entry(c.file.clone()).or_insert(0) += 1;
+        }
     }
     fs::write(&jsonl, body).unwrap();
     eprintln!(
@@ -397,4 +445,8 @@ fn main() {
         files.len(),
         jsonl.display()
     );
+    eprintln!("catalog kinds: {kinds:?}");
+    for (f, n) in &runnable_by_file {
+        eprintln!("  runnable {n:5}  {f}");
+    }
 }

@@ -133,6 +133,32 @@ int main(int argc, char** argv) {
             ++n_skip;
             continue;
         }
+        if (kind == "unlinkable") {
+            std::string wasm_rel = json_raw_string(line, "wasm");
+            std::vector<uint8_t> bytes;
+            std::string err;
+            std::string path = suite_dir + "/" + wasm_rel;
+            HostModule m;
+            bool linked = cuwasm::load_file(path, bytes, err) &&
+                          cuwasm::translate_wasm(bytes.data(), bytes.size(), m, err) &&
+                          cuwasm::verify_cuop(m, err);
+            if (linked) {
+                ++n_fail;
+                fail_by_file[file]++;
+                if (n_fail <= 15)
+                    std::cerr << "FAIL unlinkable linked " << file << "\n";
+            } else if (err.find("out of bounds") != std::string::npos ||
+                       err.find("unlinkable") != std::string::npos) {
+                ++n_trap_ok;
+            } else {
+                ++n_unsup;
+                if (err.size() > 60)
+                    err = err.substr(0, 60);
+                unsup_reason[err]++;
+                unsup_by_file[file]++;
+            }
+            continue;
+        }
         std::string wasm_rel = json_raw_string(line, "wasm");
         std::string expname = json_raw_string(line, "export");
         auto args_s = json_str_array(line, "args");
