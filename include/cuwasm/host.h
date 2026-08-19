@@ -18,6 +18,15 @@ struct HostModule {
     std::vector<FuncMeta> funcs;
     std::vector<std::pair<std::string, uint32_t>> exports;
     std::vector<uint64_t> globals;
+    std::vector<uint8_t> memory;
+    uint32_t mem_size = 0;
+    std::vector<uint8_t> data_blob;
+    std::vector<uint32_t> data_off;
+    std::vector<uint32_t> data_len;
+    std::vector<uint8_t> data_live;
+    std::vector<uint32_t> table;
+    std::vector<uint32_t> func_typeidx;
+    std::vector<uint64_t> type_fp;
 
     DevModule dev() const {
         DevModule d{};
@@ -26,6 +35,11 @@ struct HostModule {
         d.funcs = funcs.data();
         d.n_funcs = (uint32_t)funcs.size();
         d.code_len = (uint32_t)code.size();
+        d.table = table.empty() ? nullptr : table.data();
+        d.table_len = (uint32_t)table.size();
+        d.func_typeidx = func_typeidx.empty() ? nullptr : func_typeidx.data();
+        d.type_fp = type_fp.empty() ? nullptr : type_fp.data();
+        d.n_types = (uint32_t)type_fp.size();
         return d;
     }
 
@@ -49,7 +63,7 @@ bool translate_wasm(const uint8_t* data, size_t len, HostModule& out, std::strin
 bool verify_cuop(HostModule& m, std::string& err);
 std::string disasm(const HostModule& m);
 
-RunResult run_cpu(const HostModule& m, uint32_t func_idx, const uint64_t* args,
+RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args,
                   uint32_t n_args, uint64_t max_steps = DEFAULT_MAX_STEPS);
 
 bool load_file(const std::string& path, std::vector<uint8_t>& out, std::string& err);

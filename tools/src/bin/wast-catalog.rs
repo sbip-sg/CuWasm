@@ -160,6 +160,73 @@ fn main() {
                     }
                 }
                 WastDirective::Register { .. } => {}
+                WastDirective::Invoke(inv) => {
+                    if let Some(reason) = &current_skip {
+                        cases.push(Case {
+                            kind: "skip".into(),
+                            file: rel.clone(),
+                            export: inv.name.to_string(),
+                            wasm: String::new(),
+                            skip: reason.clone(),
+                            args: vec![],
+                            arg_ty: vec![],
+                            expected: vec![],
+                            exp_ty: vec![],
+                        });
+                        continue;
+                    }
+                    let Some(wasm) = &current_wasm else {
+                        cases.push(Case {
+                            kind: "skip".into(),
+                            file: rel.clone(),
+                            export: inv.name.to_string(),
+                            wasm: String::new(),
+                            skip: "no module".into(),
+                            args: vec![],
+                            arg_ty: vec![],
+                            expected: vec![],
+                            exp_ty: vec![],
+                        });
+                        continue;
+                    };
+                    let mut args_v = Vec::new();
+                    let mut arg_ty = Vec::new();
+                    let mut bad: Option<String> = None;
+                    for a in &inv.args {
+                        match arg_core(a) {
+                            Ok((bits, ty)) => {
+                                args_v.push(bits.to_string());
+                                arg_ty.push(ty.to_string());
+                            }
+                            Err(e) => bad = Some(e),
+                        }
+                    }
+                    if let Some(e) = bad {
+                        cases.push(Case {
+                            kind: "skip".into(),
+                            file: rel.clone(),
+                            export: inv.name.to_string(),
+                            wasm: wasm.clone(),
+                            skip: e,
+                            args: vec![],
+                            arg_ty: vec![],
+                            expected: vec![],
+                            exp_ty: vec![],
+                        });
+                        continue;
+                    }
+                    cases.push(Case {
+                        kind: "invoke".into(),
+                        file: rel.clone(),
+                        export: inv.name.to_string(),
+                        wasm: wasm.clone(),
+                        skip: String::new(),
+                        args: args_v,
+                        arg_ty,
+                        expected: vec![],
+                        exp_ty: vec![],
+                    });
+                }
                 WastDirective::AssertReturn { exec, results, .. } => {
                     let WastExecute::Invoke(inv) = exec else {
                         cases.push(Case {

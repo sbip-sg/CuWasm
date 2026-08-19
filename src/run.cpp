@@ -133,7 +133,7 @@ bool parse_wast_assertions(const std::string& wast_path, std::vector<Assertion>&
     return true;
 }
 
-RunResult run_cpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, uint32_t n_args,
+RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32_t n_args,
                   uint64_t max_steps) {
     RunResult r;
     if (func_idx >= m.funcs.size()) {
@@ -157,6 +157,7 @@ RunResult run_cpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
     st.fuel = 1000000000000LL;
     st.status = ST_RUNNING;
     st.peak_csp = 1;
+    st.mem_size = m.mem_size;
     frames[0] = Frame{0, 0, 0, f.n_results};
 
     for (uint32_t i = 0; i < n_args; ++i)
@@ -166,10 +167,22 @@ RunResult run_cpu(const HostModule& m, uint32_t func_idx, const uint64_t* args, 
 
     AoSView sv{stack.data(), STACK_CAP, 0};
     AoSFrameView fv{frames.data(), FRAME_CAP, 0};
-    std::vector<uint64_t> globals = m.globals;
-    run_instance(m.dev(), st, sv, fv, globals.empty() ? nullptr : globals.data(),
-                 (uint32_t)globals.size(), max_steps);
+    uint64_t dummy_g = 0;
+    uint64_t* gptr = m.globals.empty() ? &dummy_g : m.globals.data();
+    uint8_t dummy_m = 0;
+    MemView mem{m.memory.empty() ? &dummy_m : m.memory.data(), m.mem_size,
+                m.memory.empty() ? 0u : (uint32_t)m.memory.size()};
+    DataView data{};
+    data.blob = m.data_blob.empty() ? nullptr : m.data_blob.data();
+    data.blob_len = (uint32_t)m.data_blob.size();
+    data.off = m.data_off.empty() ? nullptr : m.data_off.data();
+    data.len = m.data_len.empty() ? nullptr : m.data_len.data();
+    data.live = m.data_live.empty() ? nullptr : m.data_live.data();
+    data.n = (uint32_t)m.data_live.size();
+    HostMailbox mb{};
+    run_instance(m.dev(), st, sv, fv, gptr, (uint32_t)m.globals.size(), mem, data, &mb, max_steps);
 
+    m.mem_size = st.mem_size;
     r.status = st.status;
     r.peak_csp = st.peak_csp;
     r.steps_bound = max_steps;

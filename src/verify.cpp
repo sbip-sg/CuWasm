@@ -214,6 +214,60 @@ bool verify_cuop(HostModule& m, std::string& err) {
             case OP_UNREACHABLE:
                 fall = false;
                 break;
+            case OP_LOAD:
+                if (h < 1)
+                    return fail(err, "load underflow");
+                next_h = h;
+                break;
+            case OP_STORE:
+                if (h < 2)
+                    return fail(err, "store underflow");
+                next_h = h - 2;
+                break;
+            case OP_MEMORY_SIZE:
+                next_h = h + 1;
+                break;
+            case OP_MEMORY_GROW:
+                if (h < 1)
+                    return fail(err, "memory.grow underflow");
+                next_h = h;
+                break;
+            case OP_MEMORY_COPY:
+            case OP_MEMORY_FILL:
+            case OP_MEMORY_INIT:
+                if (h < 3)
+                    return fail(err, "bulk-memory underflow");
+                next_h = h - 3;
+                break;
+            case OP_DATA_DROP:
+                next_h = h;
+                break;
+            case OP_CALL_HOST: {
+                int np = (int)(in.a & 0xffu);
+                int nr = (int)((in.a >> 8) & 0xffu);
+                if (h < np)
+                    return fail(err, "call_host underflow");
+                next_h = h - np + nr;
+                break;
+            }
+            case OP_CALL_INDIRECT: {
+                if (h < 1)
+                    return fail(err, "call_indirect underflow");
+                if (in.b >= m.type_fp.size())
+                    return fail(err, "call_indirect type oob");
+                uint64_t fpv = m.type_fp[in.b];
+                int np = (int)(fpv & 0xffu);
+                int nr = (int)((fpv >> 8) & 0xffu);
+                if (h < 1 + np)
+                    return fail(err, "call_indirect underflow");
+                next_h = h - 1 - np + nr;
+                break;
+            }
+            case OP_CLZ:
+                if (h < 1)
+                    return fail(err, "clz underflow");
+                next_h = h;
+                break;
             default:
                 return fail(err, "unknown cuop in verify");
             }

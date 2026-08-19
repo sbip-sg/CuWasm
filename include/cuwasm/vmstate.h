@@ -13,7 +13,10 @@ enum Status : uint16_t {
     ST_OUT_OF_FUEL,
     ST_UNSUPPORTED_OP,
     ST_TRAP_DIV_BY_ZERO,
-    ST_TRAP_INT_OVERFLOW
+    ST_TRAP_INT_OVERFLOW,
+    ST_TRAP_MEM_OOB,
+    ST_TRAP_INDIRECT_CALL,
+    ST_HOSTCALL_PENDING
 };
 
 inline const char* status_name(uint16_t s) {
@@ -27,6 +30,9 @@ inline const char* status_name(uint16_t s) {
     case ST_UNSUPPORTED_OP: return "unsupported_op";
     case ST_TRAP_DIV_BY_ZERO: return "trap_div_by_zero";
     case ST_TRAP_INT_OVERFLOW: return "trap_int_overflow";
+    case ST_TRAP_MEM_OOB: return "trap_mem_oob";
+    case ST_TRAP_INDIRECT_CALL: return "trap_indirect_call";
+    case ST_HOSTCALL_PENDING: return "hostcall_pending";
     default: return "unknown";
     }
 }
@@ -36,6 +42,17 @@ struct VmState {
     int64_t fuel;
     uint16_t status;
     uint32_t peak_csp;
+    uint32_t mem_size;
+    uint32_t host_fn;
+    uint16_t host_n_args;
+    uint16_t host_n_results;
+};
+
+struct HostMailbox {
+    uint32_t fn_id;
+    uint16_t n_args;
+    uint16_t n_results;
+    uint64_t args[16];
 };
 
 struct Frame {

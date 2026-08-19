@@ -68,11 +68,11 @@ static bool load_mod(int idx, const std::string& gen, HostModule& m, std::string
 }
 
 #ifdef CUWASM_TEST_GPU
-static RunResult run_one(const HostModule& m, uint32_t fi, uint64_t arg) {
+static RunResult run_one(HostModule& m, uint32_t fi, uint64_t arg) {
     return cuwasm::run_gpu(m, fi, &arg, 1);
 }
 #else
-static RunResult run_one(const HostModule& m, uint32_t fi, uint64_t arg) {
+static RunResult run_one(HostModule& m, uint32_t fi, uint64_t arg) {
     return cuwasm::run_cpu(m, fi, &arg, 1);
 }
 #endif

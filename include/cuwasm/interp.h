@@ -2,6 +2,7 @@
 
 #include "cuop.h"
 #include "layout.h"
+#include "mem.h"
 #include "vmstate.h"
 
 namespace cuwasm {
@@ -28,7 +29,8 @@ HD void mul_wide_s(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi) {
 
 template <class StackV, class FrameV>
 HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames,
-                     uint64_t* globals, uint32_t n_globals, uint64_t max_steps) {
+                     uint64_t* globals, uint32_t n_globals, MemView mem, DataView data,
+                     HostMailbox* mb, uint64_t max_steps) {
     uint32_t pc = st.pc, sp = st.sp, fp = st.fp, csp = st.csp;
     int64_t fuel = st.fuel;
     uint32_t peak_csp = st.peak_csp;
@@ -511,6 +513,181 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
 
         case OP_UNREACHABLE:
             TRAP(ST_TRAP_UNREACHABLE);
+
+        case OP_LOAD: {
+            uint32_t nbytes = in.a & 0xfu;
+            bool sgn = (in.a & 0x10u) != 0;
+            bool i64dest = (in.a & 0x20u) != 0;
+            uint64_t addr = (uint32_t)CU_POP();
+            uint64_t ea = addr + (uint64_t)in.b;
+            if (nbytes == 0 || nbytes > 8 || !mem_in_bounds(mem, ea, nbytes))
+                TRAP(ST_TRAP_MEM_OOB);
+            uint64_t v = mem_load_le(mem, ea, nbytes);
+            if (sgn) {
+                if (i64dest)
+                    v = sext64(v, nbytes * 8);
+                else
+                    v = (uint32_t)sext64(v, nbytes * 8);
+            } else if (!i64dest && nbytes < 8) {
+                v = (uint32_t)v;
+            }
+            CU_PUSH(v);
+            break;
+        }
+        case OP_STORE: {
+            uint32_t nbytes = in.a;
+            uint64_t val = CU_POP();
+            uint64_t addr = (uint32_t)CU_POP();
+            uint64_t ea = addr + (uint64_t)in.b;
+            if (nbytes == 0 || nbytes > 8 || !mem_in_bounds(mem, ea, nbytes))
+                TRAP(ST_TRAP_MEM_OOB);
+            mem_store_le(mem, ea, nbytes, val);
+            break;
+        }
+        case OP_MEMORY_SIZE:
+            CU_PUSH(mem.size / WASM_PAGE);
+            break;
+        case OP_MEMORY_GROW: {
+            uint32_t delta = (uint32_t)CU_POP();
+            uint32_t old = mem.size / WASM_PAGE;
+            uint64_t np = (uint64_t)old + (uint64_t)delta;
+            uint32_t maxp = mem.max_size / WASM_PAGE;
+            if (np > (uint64_t)maxp || np > 65536ull) {
+                CU_PUSH((uint64_t)(uint32_t)(-1));
+            } else {
+                mem.size = (uint32_t)np * WASM_PAGE;
+                CU_PUSH(old);
+            }
+            break;
+        }
+        case OP_MEMORY_COPY: {
+            uint32_t n = (uint32_t)CU_POP();
+            uint32_t src = (uint32_t)CU_POP();
+            uint32_t dst = (uint32_t)CU_POP();
+            uint64_t sn = (uint64_t)src + (uint64_t)n;
+            uint64_t dn = (uint64_t)dst + (uint64_t)n;
+            if (sn > (uint64_t)mem.size || dn > (uint64_t)mem.size)
+                TRAP(ST_TRAP_MEM_OOB);
+            if (n && mem.data) {
+                if (dst <= src) {
+                    for (uint32_t i = 0; i < n; ++i)
+                        mem.data[dst + i] = mem.data[src + i];
+                } else {
+                    for (uint32_t i = n; i-- > 0;)
+                        mem.data[dst + i] = mem.data[src + i];
+                }
+            }
+            break;
+        }
+        case OP_MEMORY_FILL: {
+            uint32_t n = (uint32_t)CU_POP();
+            uint8_t val = (uint8_t)CU_POP();
+            uint32_t dst = (uint32_t)CU_POP();
+            if ((uint64_t)dst + (uint64_t)n > (uint64_t)mem.size)
+                TRAP(ST_TRAP_MEM_OOB);
+            if (mem.data) {
+                for (uint32_t i = 0; i < n; ++i)
+                    mem.data[dst + i] = val;
+            }
+            break;
+        }
+        case OP_MEMORY_INIT: {
+            uint32_t n = (uint32_t)CU_POP();
+            uint32_t src = (uint32_t)CU_POP();
+            uint32_t dst = (uint32_t)CU_POP();
+            uint32_t di = in.a;
+            if (di >= data.n)
+                TRAP(ST_TRAP_MEM_OOB);
+            uint32_t dlen = 0;
+            uint32_t doff = 0;
+            if (data.live && data.live[di]) {
+                dlen = data.len[di];
+                doff = data.off[di];
+            }
+            if ((uint64_t)src + (uint64_t)n > (uint64_t)dlen ||
+                (uint64_t)dst + (uint64_t)n > (uint64_t)mem.size)
+                TRAP(ST_TRAP_MEM_OOB);
+            if (n && mem.data && data.blob) {
+                for (uint32_t i = 0; i < n; ++i)
+                    mem.data[dst + i] = data.blob[doff + src + i];
+            }
+            break;
+        }
+        case OP_DATA_DROP: {
+            uint32_t di = in.a;
+            if (di >= data.n)
+                TRAP(ST_TRAP_MEM_OOB);
+            if (data.live)
+                data.live[di] = 0;
+            break;
+        }
+        case OP_CALL_HOST: {
+            uint16_t np = in.a & 0xffu;
+            uint16_t nr = (in.a >> 8) & 0xffu;
+            if (!mb || np > 16)
+                TRAP(ST_UNSUPPORTED_OP);
+            if (sp < np)
+                TRAP(ST_TRAP_STACK_OVERFLOW);
+            mb->fn_id = in.b;
+            mb->n_args = np;
+            mb->n_results = nr;
+            for (uint16_t i = 0; i < np; ++i)
+                mb->args[i] = stack.at(sp - np + i);
+            sp -= np;
+            st.host_fn = in.b;
+            st.host_n_args = np;
+            st.host_n_results = nr;
+            TRAP(ST_HOSTCALL_PENDING);
+        }
+        case OP_CALL_INDIRECT: {
+            uint32_t idx = (uint32_t)CU_POP();
+            if (!m.table || idx >= m.table_len)
+                TRAP(ST_TRAP_INDIRECT_CALL);
+            uint32_t fi = m.table[idx];
+            if (fi == TABLE_NULL || fi >= m.n_funcs)
+                TRAP(ST_TRAP_INDIRECT_CALL);
+            if (m.func_typeidx && m.type_fp && in.b < m.n_types) {
+                uint32_t have = m.func_typeidx[fi];
+                if (have >= m.n_types || m.type_fp[have] != m.type_fp[in.b])
+                    TRAP(ST_TRAP_INDIRECT_CALL);
+            } else {
+                TRAP(ST_TRAP_INDIRECT_CALL);
+            }
+            const FuncMeta f = m.funcs[fi];
+            if (csp >= FRAME_CAP)
+                TRAP(ST_TRAP_CALL_DEPTH);
+            if (sp < f.n_params)
+                TRAP(ST_TRAP_STACK_OVERFLOW);
+            uint32_t sp_base = sp - f.n_params;
+            frames.at(csp++) = Frame{pc, fp, sp_base, f.n_results};
+            if (csp > peak_csp)
+                peak_csp = csp;
+            fp = sp_base;
+            for (uint16_t i = 0; i < f.n_locals; ++i)
+                CU_PUSH(0);
+            pc = f.code_off;
+            break;
+        }
+
+        case OP_CLZ: {
+            uint32_t bits = in.a ? in.a : 64;
+            uint64_t v = CU_POP();
+            if (bits == 32)
+                v &= 0xffffffffull;
+            uint32_t n = 0;
+            if (v == 0)
+                n = bits;
+            else {
+                uint64_t mask = 1ull << (bits - 1);
+                while ((v & mask) == 0) {
+                    n++;
+                    mask >>= 1;
+                }
+            }
+            CU_PUSH(n);
+            break;
+        }
+
         default:
             TRAP(ST_UNSUPPORTED_OP);
         }
@@ -525,6 +702,7 @@ done:
     st.csp = csp;
     st.fuel = fuel;
     st.peak_csp = peak_csp;
+    st.mem_size = mem.size;
 #undef CU_PUSH
 #undef CU_POP
 #undef TRAP

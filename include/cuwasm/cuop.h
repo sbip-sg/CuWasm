@@ -75,6 +75,17 @@ enum CuOpcode : uint16_t {
     OP_I64_MUL_WIDE_U,
     OP_I64_ADD128,
     OP_I64_SUB128,
+    OP_LOAD,
+    OP_STORE,
+    OP_MEMORY_SIZE,
+    OP_MEMORY_GROW,
+    OP_MEMORY_COPY,
+    OP_MEMORY_FILL,
+    OP_MEMORY_INIT,
+    OP_DATA_DROP,
+    OP_CALL_HOST,
+    OP_CALL_INDIRECT,
+    OP_CLZ,
 };
 
 struct alignas(8) CuOp {
@@ -93,6 +104,11 @@ struct DevModule {
     const uint64_t* consts;
     const FuncMeta* funcs;
     uint32_t n_funcs, code_len;
+    const uint32_t* table;
+    uint32_t table_len;
+    const uint32_t* func_typeidx;
+    const uint64_t* type_fp;
+    uint32_t n_types;
 };
 
 inline const char* opcode_name(uint16_t op) {
@@ -167,6 +183,17 @@ inline const char* opcode_name(uint16_t op) {
     case OP_I64_MUL_WIDE_U: return "i64.mul_wide_u";
     case OP_I64_ADD128: return "i64.add128";
     case OP_I64_SUB128: return "i64.sub128";
+    case OP_LOAD: return "load";
+    case OP_STORE: return "store";
+    case OP_MEMORY_SIZE: return "memory.size";
+    case OP_MEMORY_GROW: return "memory.grow";
+    case OP_MEMORY_COPY: return "memory.copy";
+    case OP_MEMORY_FILL: return "memory.fill";
+    case OP_MEMORY_INIT: return "memory.init";
+    case OP_DATA_DROP: return "data.drop";
+    case OP_CALL_HOST: return "call_host";
+    case OP_CALL_INDIRECT: return "call_indirect";
+    case OP_CLZ: return "clz";
     default: return "???";
     }
 }

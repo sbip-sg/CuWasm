@@ -210,6 +210,16 @@ int main(int argc, char** argv) {
             unsup_by_file[file]++;
             continue;
         }
+        if (kind == "invoke") {
+            if (r.status != ST_OK) {
+                ++n_fail;
+                fail_by_file[file]++;
+                if (n_fail <= 15)
+                    std::cerr << "FAIL invoke " << file << " " << expname
+                              << " status=" << cuwasm::status_name(r.status) << "\n";
+            }
+            continue;
+        }
         if (kind == "trap") {
             if (r.status != ST_OK && r.status != cuwasm::ST_RUNNING) {
                 ++n_trap_ok;

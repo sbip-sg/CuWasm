@@ -4,7 +4,10 @@ use libc::c_char;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
-use wasmparser::{BlockType, CompositeInnerType, ExternalKind, Operator, Parser, Payload, ValType};
+use wasmparser::{
+    BlockType, CompositeInnerType, DataKind, ElementItems, ElementKind, ExternalKind, MemArg,
+    Operator, Parser, Payload, ValType,
+};
 
 pub const OP_UNREACHABLE: u16 = 0;
 pub const OP_I64_CONST: u16 = 1;
@@ -76,6 +79,21 @@ pub const OP_I64_MUL_WIDE_S: u16 = 66;
 pub const OP_I64_MUL_WIDE_U: u16 = 67;
 pub const OP_I64_ADD128: u16 = 68;
 pub const OP_I64_SUB128: u16 = 69;
+pub const OP_LOAD: u16 = 70;
+pub const OP_STORE: u16 = 71;
+pub const OP_MEMORY_SIZE: u16 = 72;
+pub const OP_MEMORY_GROW: u16 = 73;
+pub const OP_MEMORY_COPY: u16 = 74;
+pub const OP_MEMORY_FILL: u16 = 75;
+pub const OP_MEMORY_INIT: u16 = 76;
+pub const OP_DATA_DROP: u16 = 77;
+pub const OP_CALL_HOST: u16 = 78;
+pub const OP_CALL_INDIRECT: u16 = 79;
+pub const OP_CLZ: u16 = 80;
+
+const WASM_PAGE: u32 = 65536;
+const CUWASM_MEM_MAX_PAGES: u64 = 1024;
+const TABLE_NULL: u32 = 0xFFFF_FFFF;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +127,20 @@ pub struct TranslateOut {
     pub n_exports: u32,
     pub globals: *mut u64,
     pub n_globals: u32,
+    pub memory: *mut u8,
+    pub mem_size: u32,
+    pub mem_max: u32,
+    pub data_blob: *mut u8,
+    pub data_blob_len: u32,
+    pub data_off: *mut u32,
+    pub data_len: *mut u32,
+    pub data_live: *mut u8,
+    pub n_data: u32,
+    pub table: *mut u32,
+    pub table_len: u32,
+    pub func_typeidx: *mut u32,
+    pub type_fp: *mut u64,
+    pub n_types: u32,
     pub err: *mut c_char,
 }
 
@@ -126,6 +158,20 @@ impl Default for TranslateOut {
             n_exports: 0,
             globals: ptr::null_mut(),
             n_globals: 0,
+            memory: ptr::null_mut(),
+            mem_size: 0,
+            mem_max: 0,
+            data_blob: ptr::null_mut(),
+            data_blob_len: 0,
+            data_off: ptr::null_mut(),
+            data_len: ptr::null_mut(),
+            data_live: ptr::null_mut(),
+            n_data: 0,
+            table: ptr::null_mut(),
+            table_len: 0,
+            func_typeidx: ptr::null_mut(),
+            type_fp: ptr::null_mut(),
+            n_types: 0,
             err: ptr::null_mut(),
         }
     }
@@ -138,6 +184,16 @@ pub struct HostModule {
     pub funcs: Vec<FuncMetaC>,
     pub exports: Vec<(String, u32)>,
     pub globals: Vec<u64>,
+    pub memory: Vec<u8>,
+    pub mem_size: u32,
+    pub mem_max: u32,
+    pub data_blob: Vec<u8>,
+    pub data_off: Vec<u32>,
+    pub data_len: Vec<u32>,
+    pub data_live: Vec<u8>,
+    pub table: Vec<u32>,
+    pub func_typeidx: Vec<u32>,
+    pub type_fp: Vec<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +217,78 @@ struct Ctrl {
     dead_on_entry: bool,
 }
 
+fn type_fingerprint(params: &[ValType], results: &[ValType]) -> Result<u64, String> {
+    if params.len() > 8 || results.len() > 8 {
+        return Err("too many params/results for type fingerprint".into());
+    }
+    let tag = |t: ValType| -> Result<u64, String> {
+        Ok(match t {
+            ValType::I32 => 0,
+            ValType::I64 => 1,
+            ValType::F32 => 2,
+            ValType::F64 => 3,
+            _ => return Err(format!("unsupported valtype {:?}", t)),
+        })
+    };
+    let mut fp = params.len() as u64 | ((results.len() as u64) << 8);
+    for (i, t) in params.iter().enumerate() {
+        fp |= tag(*t)? << (16 + 2 * i);
+    }
+    for (i, t) in results.iter().enumerate() {
+        fp |= tag(*t)? << (32 + 2 * i);
+    }
+    Ok(fp)
+}
+
+fn load_flags(nbytes: u16, signed: bool, i64dest: bool) -> u16 {
+    nbytes | (if signed { 0x10 } else { 0 }) | (if i64dest { 0x20 } else { 0 })
+}
+
+fn check_memarg(memarg: MemArg) -> Result<u32, String> {
+    if memarg.memory != 0 {
+        return Err("multi-memory not supported".into());
+    }
+    if memarg.offset > u32::MAX as u64 {
+        return Err("memory64 offset".into());
+    }
+    Ok(memarg.offset as u32)
+}
+
+fn eval_i32_expr<'a, I>(ops: I) -> Result<u32, String>
+where
+    I: IntoIterator<Item = Result<Operator<'a>, wasmparser::BinaryReaderError>>,
+{
+    let mut st: Vec<i32> = Vec::new();
+    for op in ops {
+        let op = op.map_err(|e| format!("constexpr: {e}"))?;
+        match op {
+            Operator::I32Const { value } => st.push(value),
+            Operator::I32Add => {
+                let b = st.pop().ok_or("constexpr underflow")?;
+                let a = st.pop().ok_or("constexpr underflow")?;
+                st.push(a.wrapping_add(b));
+            }
+            Operator::I32Sub => {
+                let b = st.pop().ok_or("constexpr underflow")?;
+                let a = st.pop().ok_or("constexpr underflow")?;
+                st.push(a.wrapping_sub(b));
+            }
+            Operator::I32Mul => {
+                let b = st.pop().ok_or("constexpr underflow")?;
+                let a = st.pop().ok_or("constexpr underflow")?;
+                st.push(a.wrapping_mul(b));
+            }
+            Operator::End => {}
+            Operator::GlobalGet { .. } => return Err("imported global in offset expr".into()),
+            other => return Err(format!("unsupported constexpr {other:?}")),
+        }
+    }
+    st.last()
+        .copied()
+        .map(|v| v as u32)
+        .ok_or_else(|| "empty constexpr".into())
+}
+
 fn intern(consts: &mut Vec<u64>, v: u64) -> u32 {
     if let Some(i) = consts.iter().position(|&x| x == v) {
         return i as u32;
@@ -181,8 +309,9 @@ fn patch_b(code: &mut [CuOpC], pc: u32, b: u32) {
 
 fn only_int(ts: &[ValType]) -> Result<(), String> {
     for t in ts {
-        if *t != ValType::I64 && *t != ValType::I32 {
-            return Err(format!("unsupported valtype {:?}", t));
+        match *t {
+            ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64 => {}
+            _ => return Err(format!("unsupported valtype {:?}", t)),
         }
     }
     Ok(())
@@ -769,6 +898,199 @@ fn lower_operators(
                 emit(code, OP_RETURN_CALL, 0, function_index);
                 dead = true;
             }
+            Operator::CallIndirect {
+                type_index,
+                table_index,
+            } => {
+                if table_index != 0 {
+                    return Err("multi-table not supported".into());
+                }
+                let t = type_index as usize;
+                if t >= func_types.len() {
+                    return Err("call_indirect type oob".into());
+                }
+                let np = func_types[t].0.len() as i32;
+                let nr = func_types[t].1.len() as i32;
+                emit(code, OP_CALL_INDIRECT, 0, type_index);
+                consume(&mut h, dead, 1 + np, nr)?;
+            }
+            Operator::I32Load { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(4, false, false), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(8, false, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I32Load8S { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(1, true, false), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I32Load8U { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(1, false, false), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I32Load16S { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(2, true, false), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I32Load16U { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(2, false, false), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load8S { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(1, true, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load8U { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(1, false, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load16S { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(2, true, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load16U { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(2, false, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load32S { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(4, true, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Load32U { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(4, false, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I32Store { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 4, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I64Store { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 8, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I32Store8 { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 1, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I32Store16 { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 2, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I64Store8 { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 1, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I64Store16 { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 2, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I64Store32 { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 4, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::MemorySize { mem } => {
+                if mem != 0 {
+                    return Err("multi-memory not supported".into());
+                }
+                emit(code, OP_MEMORY_SIZE, 0, 0);
+                consume(&mut h, dead, 0, 1)?;
+            }
+            Operator::MemoryGrow { mem } => {
+                if mem != 0 {
+                    return Err("multi-memory not supported".into());
+                }
+                emit(code, OP_MEMORY_GROW, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::MemoryCopy { dst_mem, src_mem } => {
+                if dst_mem != 0 || src_mem != 0 {
+                    return Err("multi-memory not supported".into());
+                }
+                emit(code, OP_MEMORY_COPY, 0, 0);
+                consume(&mut h, dead, 3, 0)?;
+            }
+            Operator::MemoryFill { mem } => {
+                if mem != 0 {
+                    return Err("multi-memory not supported".into());
+                }
+                emit(code, OP_MEMORY_FILL, 0, 0);
+                consume(&mut h, dead, 3, 0)?;
+            }
+            Operator::MemoryInit { data_index, mem } => {
+                if mem != 0 {
+                    return Err("multi-memory not supported".into());
+                }
+                emit(code, OP_MEMORY_INIT, data_index as u16, 0);
+                consume(&mut h, dead, 3, 0)?;
+            }
+            Operator::DataDrop { data_index } => {
+                emit(code, OP_DATA_DROP, data_index as u16, 0);
+            }
+            Operator::I32Clz => {
+                emit(code, OP_CLZ, 32, 0);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::I64Clz => {
+                emit(code, OP_CLZ, 64, 0);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::F32Const { value } => {
+                let idx = intern(consts, value.bits() as u64);
+                emit(code, OP_I64_CONST, 0, idx);
+                consume(&mut h, dead, 0, 1)?;
+            }
+            Operator::F64Const { value } => {
+                let idx = intern(consts, value.bits());
+                emit(code, OP_I64_CONST, 0, idx);
+                consume(&mut h, dead, 0, 1)?;
+            }
+            Operator::F32Load { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(4, false, false), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::F64Load { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_LOAD, load_flags(8, false, true), off);
+                consume(&mut h, dead, 1, 1)?;
+            }
+            Operator::F32Store { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 4, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::F64Store { memarg } => {
+                let off = check_memarg(memarg)?;
+                emit(code, OP_STORE, 8, off);
+                consume(&mut h, dead, 2, 0)?;
+            }
+            Operator::I32ReinterpretF32
+            | Operator::F32ReinterpretI32
+            | Operator::I64ReinterpretF64
+            | Operator::F64ReinterpretI64 => {
+                consume(&mut h, dead, 1, 1)?;
+            }
             other => {
                 return Err(format!("unsupported wasm opcode: {:?}", other));
             }
@@ -799,8 +1121,13 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
     let mut consts: Vec<u64> = Vec::new();
     let mut funcs: Vec<FuncMetaC> = Vec::new();
     let mut globals: Vec<u64> = Vec::new();
-    let mut saw_memory = false;
-    let mut saw_import = false;
+    let mut mem_min: u64 = 0;
+    let mut mem_max_pages: Option<u64> = None;
+    let mut has_memory = false;
+    let mut table: Vec<u32> = Vec::new();
+    let mut pending_data: Vec<(bool, u32, Vec<u8>)> = Vec::new(); // (active, offset, bytes) offset unused if !active
+    let mut pending_elem: Vec<(u32, Vec<u32>)> = Vec::new(); // (table_off, func indices)
+    let mut saw_import: Option<String> = None;
 
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| format!("parse: {e}"))?;
@@ -829,15 +1156,126 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
             }
             Payload::ImportSection(reader) => {
                 for imp in reader {
-                    let _ = imp.map_err(|e| format!("import: {e}"))?;
-                    saw_import = true;
+                    let imp = imp.map_err(|e| format!("import: {e}"))?;
+                    saw_import = Some(format!("{}::{}", imp.module, imp.name));
+                    let _ = imp.ty;
                 }
             }
-            Payload::MemorySection(_) => saw_memory = true,
+            Payload::MemorySection(reader) => {
+                for mt in reader {
+                    let mt = mt.map_err(|e| format!("memory: {e}"))?;
+                    if has_memory {
+                        return Err("multiple memories not supported".into());
+                    }
+                    if mt.memory64 {
+                        return Err("memory64 not supported".into());
+                    }
+                    if mt.shared {
+                        return Err("shared memory not supported".into());
+                    }
+                    if mt.page_size_log2.is_some() {
+                        return Err("custom page size not supported".into());
+                    }
+                    mem_min = mt.initial;
+                    mem_max_pages = mt.maximum;
+                    has_memory = true;
+                }
+            }
+            Payload::TableSection(reader) => {
+                for t in reader {
+                    let t = t.map_err(|e| format!("table: {e}"))?;
+                    if !table.is_empty() {
+                        return Err("multiple tables not supported".into());
+                    }
+                    if t.ty.table64 {
+                        return Err("table64 not supported".into());
+                    }
+                    if !t.ty.element_type.is_func_ref() {
+                        return Err(format!("unsupported table elem type {:?}", t.ty.element_type));
+                    }
+                    if t.ty.initial > 1024 {
+                        return Err("table too large".into());
+                    }
+                    table = vec![TABLE_NULL; t.ty.initial as usize];
+                }
+            }
+            Payload::ElementSection(reader) => {
+                for el in reader {
+                    let el = el.map_err(|e| format!("elem: {e}"))?;
+                    let off = match el.kind {
+                        ElementKind::Active {
+                            table_index,
+                            offset_expr,
+                        } => {
+                            if table_index.unwrap_or(0) != 0 {
+                                return Err("elem to non-zero table".into());
+                            }
+                            eval_i32_expr(offset_expr.get_operators_reader())?
+                        }
+                        ElementKind::Passive | ElementKind::Declared => {
+                            return Err("passive/declared elem not supported".into());
+                        }
+                    };
+                    let mut idxs = Vec::new();
+                    match el.items {
+                        ElementItems::Functions(r) => {
+                            for i in r {
+                                idxs.push(i.map_err(|e| format!("elem func: {e}"))?);
+                            }
+                        }
+                        ElementItems::Expressions(_, r) => {
+                            for expr in r {
+                                let expr = expr.map_err(|e| format!("elem expr: {e}"))?;
+                                let mut fidx: Option<u32> = None;
+                                for op in expr.get_operators_reader() {
+                                    let op = op.map_err(|e| format!("elem op: {e}"))?;
+                                    match op {
+                                        Operator::RefFunc { function_index } => {
+                                            fidx = Some(function_index)
+                                        }
+                                        Operator::RefNull { .. } => fidx = Some(TABLE_NULL),
+                                        Operator::End => {}
+                                        other => {
+                                            return Err(format!("unsupported elem expr {other:?}"))
+                                        }
+                                    }
+                                }
+                                idxs.push(fidx.ok_or("empty elem expr")?);
+                            }
+                        }
+                    }
+                    pending_elem.push((off, idxs));
+                }
+            }
+            Payload::DataSection(reader) => {
+                for d in reader {
+                    let d = d.map_err(|e| format!("data: {e}"))?;
+                    match d.kind {
+                        DataKind::Active {
+                            memory_index,
+                            offset_expr,
+                        } => {
+                            if memory_index != 0 {
+                                return Err("data to non-zero memory".into());
+                            }
+                            let off = eval_i32_expr(offset_expr.get_operators_reader())?;
+                            pending_data.push((true, off, d.data.to_vec()));
+                        }
+                        DataKind::Passive => {
+                            pending_data.push((false, 0, d.data.to_vec()));
+                        }
+                    }
+                }
+            }
+            Payload::DataCountSection { .. } => {}
             Payload::GlobalSection(reader) => {
                 for g in reader {
                     let g = g.map_err(|e| format!("global: {e}"))?;
-                    if g.ty.content_type != ValType::I32 && g.ty.content_type != ValType::I64 {
+                    if g.ty.content_type != ValType::I32
+                        && g.ty.content_type != ValType::I64
+                        && g.ty.content_type != ValType::F32
+                        && g.ty.content_type != ValType::F64
+                    {
                         return Err(format!("unsupported global type {:?}", g.ty.content_type));
                     }
                     let mut val: Option<u64> = None;
@@ -846,6 +1284,8 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                         match op {
                             Operator::I32Const { value } => val = Some(value as u32 as u64),
                             Operator::I64Const { value } => val = Some(value as u64),
+                            Operator::F32Const { value } => val = Some(value.bits() as u64),
+                            Operator::F64Const { value } => val = Some(value.bits()),
                             Operator::End => {}
                             other => return Err(format!("unsupported global init {other:?}")),
                         }
@@ -879,7 +1319,11 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                     .map_err(|e| format!("locals: {e}"))?;
                 for loc in locals_reader {
                     let (cnt, ty) = loc.map_err(|e| format!("local: {e}"))?;
-                    if ty != ValType::I64 && ty != ValType::I32 {
+                    if ty != ValType::I64
+                        && ty != ValType::I32
+                        && ty != ValType::F32
+                        && ty != ValType::F64
+                    {
                         return Err(format!("non-int local {:?}", ty));
                     }
                     n_locals = n_locals
@@ -896,7 +1340,7 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                 for op in ops_reader {
                     ops.push(op.map_err(|e| format!("op: {e}"))?);
                 }
-                let meta = lower_operators(
+                let meta = match lower_operators(
                     ops,
                     n_params,
                     n_results,
@@ -905,26 +1349,90 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                     &mut consts,
                     &func_types,
                     &func_typeidx,
-                )?;
+                ) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let code_off = code.len() as u32;
+                        emit(&mut code, OP_UNREACHABLE, 0, 0);
+                        emit(&mut code, OP_END_FUNC, n_results, 0);
+                        FuncMetaC {
+                            code_off,
+                            code_len: 2,
+                            n_params,
+                            n_results,
+                            n_locals: 0,
+                            max_stack: 0,
+                        }
+                    }
+                };
                 funcs.push(meta);
             }
             Payload::StartSection { .. } => return Err("start section not supported".into()),
-            Payload::TableSection(_)
-            | Payload::ElementSection(_)
-            | Payload::DataSection(_)
-            | Payload::DataCountSection { .. } => {
-                return Err("table/element/data not supported in stage 1".into());
-            }
             _ => {}
         }
     }
 
-    if saw_import {
-        return Err("imports not supported in stage 1".into());
+    if let Some(name) = saw_import {
+        return Err(format!("imports not supported: {name}"));
     }
-    if saw_memory {
-        return Err("memory not supported in stage 1".into());
+
+    let mut type_fp = Vec::new();
+    for (p, r) in &func_types {
+        type_fp.push(type_fingerprint(p, r)?);
     }
+
+    let cap_pages = mem_max_pages
+        .unwrap_or(CUWASM_MEM_MAX_PAGES)
+        .min(CUWASM_MEM_MAX_PAGES);
+    if has_memory && mem_min > cap_pages {
+        return Err("memory too large for host".into());
+    }
+    let mem_max = if has_memory {
+        (cap_pages as u32).saturating_mul(WASM_PAGE)
+    } else {
+        0
+    };
+    let mem_size = if has_memory {
+        (mem_min as u32).saturating_mul(WASM_PAGE)
+    } else {
+        0
+    };
+    let mut memory = vec![0u8; mem_max as usize];
+
+    let mut data_blob = Vec::new();
+    let mut data_off = Vec::new();
+    let mut data_len = Vec::new();
+    let mut data_live = Vec::new();
+    for (active, off, bytes) in pending_data {
+        let start = data_blob.len() as u32;
+        data_blob.extend_from_slice(&bytes);
+        data_off.push(start);
+        data_len.push(bytes.len() as u32);
+        if active {
+            let end = off as u64 + bytes.len() as u64;
+            if end > mem_size as u64 {
+                return Err("data segment out of bounds".into());
+            }
+            if !bytes.is_empty() {
+                let o = off as usize;
+                memory[o..o + bytes.len()].copy_from_slice(&bytes);
+            }
+            data_live.push(0);
+        } else {
+            data_live.push(1);
+        }
+    }
+
+    for (off, idxs) in pending_elem {
+        for (i, fi) in idxs.into_iter().enumerate() {
+            let slot = off as usize + i;
+            if slot >= table.len() {
+                return Err("elem segment out of bounds".into());
+            }
+            table[slot] = fi;
+        }
+    }
+
     if funcs.is_empty() {
         return Err("no functions".into());
     }
@@ -935,6 +1443,16 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
         funcs,
         exports,
         globals,
+        memory,
+        mem_size,
+        mem_max,
+        data_blob,
+        data_off,
+        data_len,
+        data_live,
+        table,
+        func_typeidx,
+        type_fp,
     })
 }
 
@@ -991,6 +1509,24 @@ pub unsafe extern "C" fn cuwasm_translate_wasm(
             let (export_idxs, n_exports2) = vec_to_raw(idxs);
             debug_assert_eq!(n_exports1, n_exports2);
             let (globals, n_globals) = vec_to_raw(m.globals);
+            let mem_size = m.mem_size;
+            let mem_max = m.mem_max;
+            let (memory, mem_max_chk) = vec_to_raw(m.memory);
+            debug_assert_eq!(mem_max, mem_max_chk);
+            let data_blob_len_expect = m.data_blob.len() as u32;
+            let (data_blob, data_blob_len) = vec_to_raw(m.data_blob);
+            debug_assert_eq!(data_blob_len_expect, data_blob_len);
+            let n_data = m.data_live.len() as u32;
+            let (data_off, n1) = vec_to_raw(m.data_off);
+            let (data_len, n2) = vec_to_raw(m.data_len);
+            let (data_live, n3) = vec_to_raw(m.data_live);
+            debug_assert_eq!(n_data, n1);
+            debug_assert_eq!(n_data, n2);
+            debug_assert_eq!(n_data, n3);
+            let (table, table_len) = vec_to_raw(m.table);
+            let (func_typeidx, n_tidx) = vec_to_raw(m.func_typeidx);
+            debug_assert_eq!(n_tidx, n_funcs);
+            let (type_fp, n_types) = vec_to_raw(m.type_fp);
             (*out).code = code;
             (*out).n_code = n_code;
             (*out).consts = consts;
@@ -1002,6 +1538,20 @@ pub unsafe extern "C" fn cuwasm_translate_wasm(
             (*out).n_exports = n_exports1;
             (*out).globals = globals;
             (*out).n_globals = n_globals;
+            (*out).memory = memory;
+            (*out).mem_size = mem_size;
+            (*out).mem_max = mem_max;
+            (*out).data_blob = data_blob;
+            (*out).data_blob_len = data_blob_len;
+            (*out).data_off = data_off;
+            (*out).data_len = data_len;
+            (*out).data_live = data_live;
+            (*out).n_data = n_data;
+            (*out).table = table;
+            (*out).table_len = table_len;
+            (*out).func_typeidx = func_typeidx;
+            (*out).type_fp = type_fp;
+            (*out).n_types = n_types;
             0
         }
         Err(e) => {
@@ -1034,6 +1584,14 @@ pub unsafe extern "C" fn cuwasm_translate_free(out: *mut TranslateOut) {
     }
     free_vec(o.export_idxs, o.n_exports);
     free_vec(o.globals, o.n_globals);
+    free_vec(o.memory, o.mem_max);
+    free_vec(o.data_blob, o.data_blob_len);
+    free_vec(o.data_off, o.n_data);
+    free_vec(o.data_len, o.n_data);
+    free_vec(o.data_live, o.n_data);
+    free_vec(o.table, o.table_len);
+    free_vec(o.func_typeidx, o.n_funcs);
+    free_vec(o.type_fp, o.n_types);
     if !o.err.is_null() {
         let _ = CString::from_raw(o.err);
     }

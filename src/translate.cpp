@@ -24,6 +24,20 @@ struct TranslateOut {
     uint32_t n_exports;
     uint64_t* globals;
     uint32_t n_globals;
+    uint8_t* memory;
+    uint32_t mem_size;
+    uint32_t mem_max;
+    uint8_t* data_blob;
+    uint32_t data_blob_len;
+    uint32_t* data_off;
+    uint32_t* data_len;
+    uint8_t* data_live;
+    uint32_t n_data;
+    uint32_t* table;
+    uint32_t table_len;
+    uint32_t* func_typeidx;
+    uint64_t* type_fp;
+    uint32_t n_types;
     char* err;
 };
 int cuwasm_translate_wasm(const uint8_t* data, size_t len, TranslateOut* out);
@@ -61,6 +75,25 @@ bool translate_wasm(const uint8_t* data, size_t len, HostModule& out, std::strin
     }
     if (t.n_globals && t.globals)
         out.globals.assign(t.globals, t.globals + t.n_globals);
+    out.mem_size = t.mem_size;
+    if (t.mem_max && t.memory)
+        out.memory.assign(t.memory, t.memory + t.mem_max);
+    if (t.data_blob_len && t.data_blob)
+        out.data_blob.assign(t.data_blob, t.data_blob + t.data_blob_len);
+    if (t.n_data) {
+        if (t.data_off)
+            out.data_off.assign(t.data_off, t.data_off + t.n_data);
+        if (t.data_len)
+            out.data_len.assign(t.data_len, t.data_len + t.n_data);
+        if (t.data_live)
+            out.data_live.assign(t.data_live, t.data_live + t.n_data);
+    }
+    if (t.table_len && t.table)
+        out.table.assign(t.table, t.table + t.table_len);
+    if (t.n_funcs && t.func_typeidx)
+        out.func_typeidx.assign(t.func_typeidx, t.func_typeidx + t.n_funcs);
+    if (t.n_types && t.type_fp)
+        out.type_fp.assign(t.type_fp, t.type_fp + t.n_types);
     cuwasm_translate_free(&t);
     return true;
 }
