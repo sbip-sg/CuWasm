@@ -24,6 +24,10 @@ path = "src/bin/wast-catalog.rs"
 name = "wasm-profile"
 path = "src/bin/wasm-profile.rs"
 
+[[bin]]
+name = "wat2wasm"
+path = "src/bin/wat2wasm.rs"
+
 [dependencies]
 wasmparser = "0.227"
 wat = "1.227"

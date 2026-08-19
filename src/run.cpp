@@ -6,6 +6,25 @@
 
 namespace cuwasm {
 
+bool default_host_fn(HostCallContext& ctx, HostMailbox& mb, std::string& err) {
+    const HostModule* m = ctx.module;
+    std::string label;
+    if (m) {
+        for (uint32_t i = 0; i < m->n_host_imports; ++i) {
+            if (i < m->host_fn_id.size() && m->host_fn_id[i] == mb.fn_id) {
+                label = m->host_import_mod[i] + "::" + m->host_import_name[i];
+                if (i < m->host_import_env.size() && !m->host_import_env[i].empty())
+                    label += " (" + m->host_import_env[i] + ")";
+                break;
+            }
+        }
+    }
+    if (label.empty())
+        label = "fn_id=" + std::to_string(mb.fn_id);
+    err = "unimplemented host function: " + label;
+    return false;
+}
+
 bool load_file(const std::string& path, std::vector<uint8_t>& out, std::string& err) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -134,7 +153,7 @@ bool parse_wast_assertions(const std::string& wast_path, std::vector<Assertion>&
 }
 
 RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32_t n_args,
-                  uint64_t max_steps) {
+                  uint64_t max_steps, HostFn host_fn) {
     RunResult r;
     if (func_idx >= m.funcs.size()) {
         r.status = ST_UNSUPPORTED_OP;
@@ -145,6 +164,8 @@ RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32
         r.status = ST_UNSUPPORTED_OP;
         return r;
     }
+    if (!host_fn)
+        host_fn = default_host_fn;
 
     std::vector<uint64_t> stack(STACK_CAP, 0);
     std::vector<Frame> frames(FRAME_CAP);
@@ -180,7 +201,34 @@ RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32
     data.live = m.data_live.empty() ? nullptr : m.data_live.data();
     data.n = (uint32_t)m.data_live.size();
     HostMailbox mb{};
-    run_instance(m.dev(), st, sv, fv, gptr, (uint32_t)m.globals.size(), mem, data, &mb, max_steps);
+    HostCallContext ctx{&m};
+
+    for (;;) {
+        if (st.status == ST_HOSTCALL_PENDING) {
+            std::string herr;
+            if (!host_fn(ctx, mb, herr)) {
+                r.status = ST_UNSUPPORTED_OP;
+                r.error = herr;
+                r.peak_csp = st.peak_csp;
+                r.steps_bound = max_steps;
+                return r;
+            }
+            for (uint16_t i = 0; i < mb.n_results; ++i) {
+                if (st.sp >= STACK_CAP) {
+                    r.status = ST_TRAP_STACK_OVERFLOW;
+                    return r;
+                }
+                stack[st.sp++] = mb.results[i];
+            }
+            st.status = ST_RUNNING;
+        }
+
+        if (st.status != ST_RUNNING)
+            break;
+
+        run_instance(m.dev(), st, sv, fv, gptr, (uint32_t)m.globals.size(), mem, data, &mb,
+                     max_steps);
+    }
 
     m.mem_size = st.mem_size;
     r.status = st.status;

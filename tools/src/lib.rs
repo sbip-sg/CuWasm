@@ -1,12 +1,14 @@
 //! WASM → CuOp lowering. Decode with wasmparser; emit fixed-width ops.
 
+mod env_fn_id;
+
 use libc::c_char;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
 use wasmparser::{
     BlockType, CompositeInnerType, DataKind, ElementItems, ElementKind, ExternalKind, MemArg,
-    Operator, Parser, Payload, ValType,
+    Operator, Parser, Payload, TypeRef, ValType,
 };
 
 pub const OP_UNREACHABLE: u16 = 0;
@@ -141,6 +143,11 @@ pub struct TranslateOut {
     pub func_typeidx: *mut u32,
     pub type_fp: *mut u64,
     pub n_types: u32,
+    pub n_host_imports: u32,
+    pub host_fn_id: *mut u32,
+    pub host_import_mod: *mut *mut c_char,
+    pub host_import_name: *mut *mut c_char,
+    pub host_import_env: *mut *mut c_char,
     pub err: *mut c_char,
 }
 
@@ -172,6 +179,11 @@ impl Default for TranslateOut {
             func_typeidx: ptr::null_mut(),
             type_fp: ptr::null_mut(),
             n_types: 0,
+            n_host_imports: 0,
+            host_fn_id: ptr::null_mut(),
+            host_import_mod: ptr::null_mut(),
+            host_import_name: ptr::null_mut(),
+            host_import_env: ptr::null_mut(),
             err: ptr::null_mut(),
         }
     }
@@ -194,6 +206,11 @@ pub struct HostModule {
     pub table: Vec<u32>,
     pub func_typeidx: Vec<u32>,
     pub type_fp: Vec<u64>,
+    pub n_host_imports: u32,
+    pub host_fn_id: Vec<u32>,
+    pub host_import_mod: Vec<String>,
+    pub host_import_name: Vec<String>,
+    pub host_import_env: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -448,6 +465,8 @@ fn lower_operators(
     consts: &mut Vec<u64>,
     func_types: &[(Vec<ValType>, Vec<ValType>)],
     func_typeidx: &[u32],
+    n_imports: u32,
+    host_fn_ids: &[u32],
 ) -> Result<FuncMetaC, String> {
     let code_off = code.len() as u32;
     let scratch = if ops.iter().any(|op| matches!(op, Operator::BrTable { .. })) {
@@ -890,11 +909,23 @@ fn lower_operators(
                 dead = true;
             }
             Operator::Call { function_index } => {
-                emit(code, OP_CALL, 0, function_index);
                 let (np, nr) = func_arity(function_index, func_types, func_typeidx)?;
+                if function_index < n_imports {
+                    let fn_id = host_fn_ids
+                        .get(function_index as usize)
+                        .copied()
+                        .ok_or_else(|| "host fn_id oob".to_string())?;
+                    let packed = np | (nr << 8);
+                    emit(code, OP_CALL_HOST, packed, fn_id);
+                } else {
+                    emit(code, OP_CALL, 0, function_index);
+                }
                 consume(&mut h, dead, np as i32, nr as i32)?;
             }
             Operator::ReturnCall { function_index } => {
+                if function_index < n_imports {
+                    return Err("tail call to host import not supported".into());
+                }
                 emit(code, OP_RETURN_CALL, 0, function_index);
                 dead = true;
             }
@@ -1127,7 +1158,10 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
     let mut table: Vec<u32> = Vec::new();
     let mut pending_data: Vec<(bool, u32, Vec<u8>)> = Vec::new(); // (active, offset, bytes) offset unused if !active
     let mut pending_elem: Vec<(u32, Vec<u32>)> = Vec::new(); // (table_off, func indices)
-    let mut saw_import: Option<String> = None;
+    let mut host_fn_ids: Vec<u32> = Vec::new();
+    let mut host_import_mod: Vec<String> = Vec::new();
+    let mut host_import_name: Vec<String> = Vec::new();
+    let mut host_import_env: Vec<String> = Vec::new();
 
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| format!("parse: {e}"))?;
@@ -1157,8 +1191,42 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
             Payload::ImportSection(reader) => {
                 for imp in reader {
                     let imp = imp.map_err(|e| format!("import: {e}"))?;
-                    saw_import = Some(format!("{}::{}", imp.module, imp.name));
-                    let _ = imp.ty;
+                    match imp.ty {
+                        TypeRef::Func(type_idx) => {
+                            let t = type_idx as usize;
+                            if t >= func_types.len() {
+                                return Err(format!("import type oob: {}::{}", imp.module, imp.name));
+                            }
+                            only_int(&func_types[t].0)?;
+                            only_int(&func_types[t].1)?;
+                            let mod_s = imp.module.to_string();
+                            let fn_s = imp.name.to_string();
+                            let fn_id = env_fn_id::lookup(&mod_s, &fn_s)?;
+                            let env_label = env_fn_id::label(fn_id)
+                                .unwrap_or("?")
+                                .to_string();
+                            func_typeidx.push(type_idx);
+                            host_fn_ids.push(fn_id);
+                            host_import_mod.push(mod_s);
+                            host_import_name.push(fn_s);
+                            host_import_env.push(env_label);
+                            let (ref params, ref results) = func_types[t];
+                            funcs.push(FuncMetaC {
+                                code_off: 0,
+                                code_len: 0,
+                                n_params: params.len() as u16,
+                                n_results: results.len() as u16,
+                                n_locals: 0,
+                                max_stack: 0,
+                            });
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported import {:?}: {}::{}",
+                                other, imp.module, imp.name
+                            ));
+                        }
+                    }
                 }
             }
             Payload::MemorySection(reader) => {
@@ -1349,6 +1417,8 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                     &mut consts,
                     &func_types,
                     &func_typeidx,
+                    host_fn_ids.len() as u32,
+                    &host_fn_ids,
                 ) {
                     Ok(m) => m,
                     Err(_) => {
@@ -1372,9 +1442,7 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
         }
     }
 
-    if let Some(name) = saw_import {
-        return Err(format!("imports not supported: {name}"));
-    }
+    let n_host_imports = host_fn_ids.len() as u32;
 
     let mut type_fp = Vec::new();
     for (p, r) in &func_types {
@@ -1453,6 +1521,11 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
         table,
         func_typeidx,
         type_fp,
+        n_host_imports,
+        host_fn_id: host_fn_ids,
+        host_import_mod,
+        host_import_name,
+        host_import_env,
     })
 }
 
@@ -1527,6 +1600,23 @@ pub unsafe extern "C" fn cuwasm_translate_wasm(
             let (func_typeidx, n_tidx) = vec_to_raw(m.func_typeidx);
             debug_assert_eq!(n_tidx, n_funcs);
             let (type_fp, n_types) = vec_to_raw(m.type_fp);
+            let n_host_imports = m.n_host_imports;
+            let (host_fn_id, n_host1) = vec_to_raw(m.host_fn_id);
+            debug_assert_eq!(n_host_imports, n_host1);
+            let mut himods: Vec<*mut c_char> = Vec::new();
+            let mut hinames: Vec<*mut c_char> = Vec::new();
+            let mut hienvs: Vec<*mut c_char> = Vec::new();
+            for i in 0..n_host_imports as usize {
+                himods.push(CString::new(m.host_import_mod[i].clone()).unwrap().into_raw());
+                hinames.push(CString::new(m.host_import_name[i].clone()).unwrap().into_raw());
+                hienvs.push(CString::new(m.host_import_env[i].clone()).unwrap().into_raw());
+            }
+            let (host_import_mod, n_host2) = vec_to_raw(himods);
+            let (host_import_name, n_host3) = vec_to_raw(hinames);
+            let (host_import_env, n_host4) = vec_to_raw(hienvs);
+            debug_assert_eq!(n_host_imports, n_host2);
+            debug_assert_eq!(n_host_imports, n_host3);
+            debug_assert_eq!(n_host_imports, n_host4);
             (*out).code = code;
             (*out).n_code = n_code;
             (*out).consts = consts;
@@ -1552,6 +1642,11 @@ pub unsafe extern "C" fn cuwasm_translate_wasm(
             (*out).func_typeidx = func_typeidx;
             (*out).type_fp = type_fp;
             (*out).n_types = n_types;
+            (*out).n_host_imports = n_host_imports;
+            (*out).host_fn_id = host_fn_id;
+            (*out).host_import_mod = host_import_mod;
+            (*out).host_import_name = host_import_name;
+            (*out).host_import_env = host_import_env;
             0
         }
         Err(e) => {
@@ -1592,6 +1687,21 @@ pub unsafe extern "C" fn cuwasm_translate_free(out: *mut TranslateOut) {
     free_vec(o.table, o.table_len);
     free_vec(o.func_typeidx, o.n_funcs);
     free_vec(o.type_fp, o.n_types);
+    free_vec(o.host_fn_id, o.n_host_imports);
+    for names in [o.host_import_mod, o.host_import_name, o.host_import_env] {
+        if !names.is_null() {
+            let v = Vec::from_raw_parts(
+                names,
+                o.n_host_imports as usize,
+                o.n_host_imports as usize,
+            );
+            for p in v {
+                if !p.is_null() {
+                    let _ = CString::from_raw(p);
+                }
+            }
+        }
+    }
     if !o.err.is_null() {
         let _ = CString::from_raw(o.err);
     }

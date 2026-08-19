@@ -20,8 +20,13 @@ bool verify_cuop(HostModule& m, std::string& err) {
         FuncMeta& f = m.funcs[fi];
         if ((uint64_t)f.code_off + f.code_len > m.code.size())
             return fail(err, "function code out of bounds");
-        if (f.code_len == 0)
+        if (f.code_len == 0) {
+            if (fi < m.n_host_imports) {
+                f.max_stack = f.n_params;
+                continue;
+            }
             return fail(err, "empty function");
+        }
         const CuOp& last = m.code[f.code_off + f.code_len - 1];
         if (last.op != OP_RETURN && last.op != OP_END_FUNC)
             return fail(err, "function does not end in return/end_func");

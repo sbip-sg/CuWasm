@@ -53,6 +53,7 @@ struct HostMailbox {
     uint16_t n_args;
     uint16_t n_results;
     uint64_t args[16];
+    uint64_t results[1];
 };
 
 struct Frame {

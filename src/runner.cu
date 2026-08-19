@@ -31,7 +31,7 @@ static bool cuda_ok(cudaError_t e, std::string& err, const char* what) {
 }
 
 RunResult run_gpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32_t n_args,
-                  uint64_t max_steps) {
+                  uint64_t max_steps, HostFn host_fn) {
     RunResult r;
     if (func_idx >= m.funcs.size()) {
         r.status = ST_UNSUPPORTED_OP;
@@ -42,6 +42,8 @@ RunResult run_gpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32
         r.status = ST_UNSUPPORTED_OP;
         return r;
     }
+    if (!host_fn)
+        host_fn = default_host_fn;
 
     std::vector<uint64_t> h_stack(STACK_CAP, 0);
     std::vector<Frame> h_frames(FRAME_CAP);
@@ -214,31 +216,76 @@ RunResult run_gpu(HostModule& m, uint32_t func_idx, const uint64_t* args, uint32
     dm.type_fp = m.type_fp.empty() ? nullptr : d_tfp;
     dm.n_types = (uint32_t)m.type_fp.size();
 
-    k_run<<<1, 1>>>(dm, d_st, d_stack, d_frames, d_globals, n_globals, d_mem, mem_max, d_blob,
-                    (uint32_t)m.data_blob.size(), d_doff, d_dlen, d_live, (uint32_t)m.data_live.size(),
-                    d_mb, STACK_CAP, FRAME_CAP, max_steps);
-    if (!cuda_ok(cudaGetLastError(), err, "launch"))
-        return fail(ST_UNSUPPORTED_OP);
-    if (!cuda_ok(cudaDeviceSynchronize(), err, "sync"))
-        return fail(ST_UNSUPPORTED_OP);
+    HostMailbox h_mb{};
+    HostCallContext ctx{&m};
 
-    if (!cuda_ok(cudaMemcpy(&st, d_st, sizeof(VmState), cudaMemcpyDeviceToHost), err, "d2h st"))
-        return fail(ST_UNSUPPORTED_OP);
-    if (!cuda_ok(cudaMemcpy(h_stack.data(), d_stack, STACK_CAP * sizeof(uint64_t), cudaMemcpyDeviceToHost),
-                 err, "d2h stack"))
-        return fail(ST_UNSUPPORTED_OP);
-    if (n_globals &&
-        !cuda_ok(cudaMemcpy(m.globals.data(), d_globals, n_globals * sizeof(uint64_t),
-                            cudaMemcpyDeviceToHost),
-                 err, "d2h globals"))
-        return fail(ST_UNSUPPORTED_OP);
-    if (mem_max &&
-        !cuda_ok(cudaMemcpy(m.memory.data(), d_mem, mem_max, cudaMemcpyDeviceToHost), err, "d2h mem"))
-        return fail(ST_UNSUPPORTED_OP);
-    if (!m.data_live.empty() &&
-        !cuda_ok(cudaMemcpy(m.data_live.data(), d_live, m.data_live.size(), cudaMemcpyDeviceToHost), err,
-                 "d2h live"))
-        return fail(ST_UNSUPPORTED_OP);
+    for (;;) {
+        if (st.status == ST_HOSTCALL_PENDING) {
+            if (!cuda_ok(cudaMemcpy(&h_mb, d_mb, sizeof(HostMailbox), cudaMemcpyDeviceToHost), err,
+                         "d2h mb"))
+                return fail(ST_UNSUPPORTED_OP);
+            if (mem_max &&
+                !cuda_ok(cudaMemcpy(m.memory.data(), d_mem, mem_max, cudaMemcpyDeviceToHost), err,
+                         "d2h mem for host"))
+                return fail(ST_UNSUPPORTED_OP);
+            std::string herr;
+            if (!host_fn(ctx, h_mb, herr)) {
+                r.status = ST_UNSUPPORTED_OP;
+                r.error = herr;
+                r.peak_csp = st.peak_csp;
+                return fail(ST_UNSUPPORTED_OP);
+            }
+            for (uint16_t i = 0; i < h_mb.n_results; ++i) {
+                if (st.sp >= STACK_CAP)
+                    return fail(ST_TRAP_STACK_OVERFLOW);
+                h_stack[st.sp++] = h_mb.results[i];
+            }
+            st.status = ST_RUNNING;
+            if (!cuda_ok(cudaMemcpy(d_st, &st, sizeof(VmState), cudaMemcpyHostToDevice), err,
+                         "h2d st resume"))
+                return fail(ST_UNSUPPORTED_OP);
+            if (!cuda_ok(cudaMemcpy(d_stack, h_stack.data(), STACK_CAP * sizeof(uint64_t),
+                                    cudaMemcpyHostToDevice),
+                         err, "h2d stack resume"))
+                return fail(ST_UNSUPPORTED_OP);
+            if (mem_max &&
+                !cuda_ok(cudaMemcpy(d_mem, m.memory.data(), mem_max, cudaMemcpyHostToDevice), err,
+                         "h2d mem resume"))
+                return fail(ST_UNSUPPORTED_OP);
+        }
+
+        if (st.status != ST_RUNNING)
+            break;
+
+        k_run<<<1, 1>>>(dm, d_st, d_stack, d_frames, d_globals, n_globals, d_mem, mem_max, d_blob,
+                        (uint32_t)m.data_blob.size(), d_doff, d_dlen, d_live, (uint32_t)m.data_live.size(),
+                        d_mb, STACK_CAP, FRAME_CAP, max_steps);
+        if (!cuda_ok(cudaGetLastError(), err, "launch"))
+            return fail(ST_UNSUPPORTED_OP);
+        if (!cuda_ok(cudaDeviceSynchronize(), err, "sync"))
+            return fail(ST_UNSUPPORTED_OP);
+
+        if (!cuda_ok(cudaMemcpy(&st, d_st, sizeof(VmState), cudaMemcpyDeviceToHost), err, "d2h st"))
+            return fail(ST_UNSUPPORTED_OP);
+        if (!cuda_ok(cudaMemcpy(h_stack.data(), d_stack, STACK_CAP * sizeof(uint64_t),
+                                cudaMemcpyDeviceToHost),
+                     err, "d2h stack"))
+            return fail(ST_UNSUPPORTED_OP);
+        if (n_globals &&
+            !cuda_ok(cudaMemcpy(m.globals.data(), d_globals, n_globals * sizeof(uint64_t),
+                                cudaMemcpyDeviceToHost),
+                     err, "d2h globals"))
+            return fail(ST_UNSUPPORTED_OP);
+        if (mem_max &&
+            !cuda_ok(cudaMemcpy(m.memory.data(), d_mem, mem_max, cudaMemcpyDeviceToHost), err,
+                     "d2h mem"))
+            return fail(ST_UNSUPPORTED_OP);
+        if (!m.data_live.empty() &&
+            !cuda_ok(cudaMemcpy(m.data_live.data(), d_live, m.data_live.size(), cudaMemcpyDeviceToHost),
+                     err, "d2h live"))
+            return fail(ST_UNSUPPORTED_OP);
+    }
+
     m.mem_size = st.mem_size;
 
     cudaFree(d_code);

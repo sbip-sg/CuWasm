@@ -12,9 +12,12 @@
 
 using cuwasm::Assertion;
 using cuwasm::HostModule;
+using cuwasm::HostCallContext;
+using cuwasm::HostMailbox;
 using cuwasm::RunResult;
 using cuwasm::ST_OK;
 using cuwasm::ST_UNSUPPORTED_OP;
+using cuwasm::OP_CALL_HOST;
 
 static int g_fails = 0;
 static int g_passes = 0;
@@ -212,6 +215,92 @@ static int test_tail_depth(const std::string& gen) {
     return 0;
 }
 
+static bool load_import_host(HostModule& m, std::string& err) {
+    std::vector<uint8_t> wasm;
+    if (!cuwasm::load_file("build/import_host.wasm", wasm, err))
+        return false;
+    if (!cuwasm::translate_wasm(wasm.data(), wasm.size(), m, err))
+        return false;
+    return cuwasm::verify_cuop(m, err);
+}
+
+static int test_import_lowering() {
+    std::string err;
+    HostModule m;
+    expect(load_import_host(m, err), "import host wasm: " + err);
+    expect(m.n_host_imports == 1, "expected 1 host import");
+    expect(!m.host_fn_id.empty(), "host_fn_id missing");
+    expect(m.host_import_mod[0] == "b" && m.host_import_name[0] == "i", "import name b::i");
+
+    bool saw_host = false;
+    uint32_t want_fn = m.host_fn_id[0];
+    for (const auto& op : m.code) {
+        if (op.op == OP_CALL_HOST) {
+            saw_host = true;
+            expect(op.b == want_fn, "call_host fn_id");
+            expect((op.a & 0xffu) == 2 && ((op.a >> 8) & 0xffu) == 1, "call_host arity");
+        }
+    }
+    expect(saw_host, "missing OP_CALL_HOST in lowered code");
+    return 0;
+}
+
+static bool g_probe_ok = false;
+
+static bool probe_host(HostCallContext& ctx, HostMailbox& mb, std::string& err) {
+    (void)ctx;
+    (void)err;
+    g_probe_ok = (mb.n_args == 2 && mb.args[0] == 100 && mb.args[1] == 5 && mb.n_results == 1);
+    mb.results[0] = 42;
+    return true;
+}
+
+static int test_hostcall_suspend() {
+    std::string err;
+    HostModule m;
+    expect(load_import_host(m, err), "import host wasm: " + err);
+    int fi = m.find_export("run");
+    expect(fi >= 0, "run export");
+    g_probe_ok = false;
+    auto r = cuwasm::run_cpu(m, (uint32_t)fi, nullptr, 0, cuwasm::DEFAULT_MAX_STEPS, probe_host);
+    expect(g_probe_ok, "host mailbox args/fn_id at suspend boundary");
+    expect(r.status == ST_OK && r.results.size() == 1 && (int64_t)r.results[0] == 42,
+           "host resume result");
+    return 0;
+}
+
+static int test_host_loud_stub() {
+    std::string err;
+    HostModule m;
+    expect(load_import_host(m, err), "import host wasm: " + err);
+    int fi = m.find_export("run");
+    expect(fi >= 0, "run export");
+    auto r = cuwasm::run_cpu(m, (uint32_t)fi, nullptr, 0);
+    expect(r.status == ST_UNSUPPORTED_OP, "loud stub status");
+    expect(r.error.find("b::i") != std::string::npos, "loud stub names import: " + r.error);
+    return 0;
+}
+
+static int test_resume(const std::string& gen) {
+    std::string err;
+    HostModule m;
+    expect(load_mod(0, gen, m, err), "resume fib mod0: " + err);
+    int fi = m.find_export("fibonacci-iter");
+    expect(fi >= 0, "fibonacci-iter export");
+    uint64_t arg = 10;
+    auto r = cuwasm::run_cpu(m, (uint32_t)fi, &arg, 1, 10);
+    expect(r.status == ST_OK && r.results.size() == 1 && (int64_t)r.results[0] == 55,
+           "fib(10) with max_steps=10 slices");
+
+    expect(load_import_host(m, err), "import host wasm: " + err);
+    fi = m.find_export("run");
+    g_probe_ok = false;
+    r = cuwasm::run_cpu(m, (uint32_t)fi, nullptr, 0, 1, probe_host);
+    expect(r.status == ST_OK && r.results.size() == 1 && (int64_t)r.results[0] == 42,
+           "host resume with max_steps=1");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string wast = "tests/fibonacci.wast";
     std::string gen = "build/gen";
@@ -241,6 +330,10 @@ int main(int argc, char** argv) {
             which = "t7";
         else if (a == "--t8" || a == "--gpu")
             which = "t8";
+        else if (a == "--t28")
+            which = "t28";
+        else if (a == "--t29")
+            which = "t29";
         else if (a == "--cpu")
             which = "cpu";
         else if (a == "--all")
@@ -264,6 +357,13 @@ int main(int argc, char** argv) {
     if (which == "t6" || which == "all" || which == "cpu" || which == "t7" || which == "t8") {
         test_fib(gen, wast, "fibonacci-tail");
         test_tail_depth(gen);
+    }
+    if (which == "t28" || which == "all" || which == "cpu")
+        test_import_lowering();
+    if (which == "t29" || which == "all" || which == "cpu") {
+        test_hostcall_suspend();
+        test_host_loud_stub();
+        test_resume(gen);
     }
     if (which == "t7" || which == "all" || which == "cpu")
         test_fib(gen, wast, nullptr);

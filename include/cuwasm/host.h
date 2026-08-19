@@ -27,6 +27,11 @@ struct HostModule {
     std::vector<uint32_t> table;
     std::vector<uint32_t> func_typeidx;
     std::vector<uint64_t> type_fp;
+    uint32_t n_host_imports = 0;
+    std::vector<uint32_t> host_fn_id;
+    std::vector<std::string> host_import_mod;
+    std::vector<std::string> host_import_name;
+    std::vector<std::string> host_import_env;
 
     DevModule dev() const {
         DevModule d{};
@@ -57,14 +62,25 @@ struct RunResult {
     std::vector<uint64_t> results;
     uint32_t peak_csp = 0;
     uint64_t steps_bound = 0;
+    std::string error;
 };
+
+struct HostCallContext {
+    const HostModule* module = nullptr;
+};
+
+/// Return true if the host call was handled. On false, `err` describes the failure.
+using HostFn = bool (*)(HostCallContext& ctx, HostMailbox& mb, std::string& err);
+
+bool default_host_fn(HostCallContext& ctx, HostMailbox& mb, std::string& err);
 
 bool translate_wasm(const uint8_t* data, size_t len, HostModule& out, std::string& err);
 bool verify_cuop(HostModule& m, std::string& err);
 std::string disasm(const HostModule& m);
 
 RunResult run_cpu(HostModule& m, uint32_t func_idx, const uint64_t* args,
-                  uint32_t n_args, uint64_t max_steps = DEFAULT_MAX_STEPS);
+                  uint32_t n_args, uint64_t max_steps = DEFAULT_MAX_STEPS,
+                  HostFn host_fn = default_host_fn);
 
 bool load_file(const std::string& path, std::vector<uint8_t>& out, std::string& err);
 

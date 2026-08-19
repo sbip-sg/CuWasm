@@ -38,6 +38,11 @@ struct TranslateOut {
     uint32_t* func_typeidx;
     uint64_t* type_fp;
     uint32_t n_types;
+    uint32_t n_host_imports;
+    uint32_t* host_fn_id;
+    char** host_import_mod;
+    char** host_import_name;
+    char** host_import_env;
     char* err;
 };
 int cuwasm_translate_wasm(const uint8_t* data, size_t len, TranslateOut* out);
@@ -94,6 +99,21 @@ bool translate_wasm(const uint8_t* data, size_t len, HostModule& out, std::strin
         out.func_typeidx.assign(t.func_typeidx, t.func_typeidx + t.n_funcs);
     if (t.n_types && t.type_fp)
         out.type_fp.assign(t.type_fp, t.type_fp + t.n_types);
+    out.n_host_imports = t.n_host_imports;
+    if (t.n_host_imports && t.host_fn_id)
+        out.host_fn_id.assign(t.host_fn_id, t.host_fn_id + t.n_host_imports);
+    out.host_import_mod.clear();
+    out.host_import_name.clear();
+    out.host_import_env.clear();
+    for (uint32_t i = 0; i < t.n_host_imports; ++i) {
+        out.host_import_mod.push_back(t.host_import_mod && t.host_import_mod[i] ? t.host_import_mod[i]
+                                                                                : "");
+        out.host_import_name.push_back(t.host_import_name && t.host_import_name[i]
+                                           ? t.host_import_name[i]
+                                           : "");
+        out.host_import_env.push_back(t.host_import_env && t.host_import_env[i] ? t.host_import_env[i]
+                                                                                : "");
+    }
     cuwasm_translate_free(&t);
     return true;
 }

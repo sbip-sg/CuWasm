@@ -21,7 +21,7 @@ TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
 all: $(BUILD)/cuwasm-run $(BUILD)/test_cpu
 
-$(RUSTLIB): tools/src/lib.rs tools/src/bin/oracle.rs tools/src/bin/wastprep.rs tools/src/bin/wast-catalog.rs tools/Cargo.toml
+$(RUSTLIB): tools/src/lib.rs tools/src/env_fn_id.rs tools/src/bin/oracle.rs tools/src/bin/wastprep.rs tools/src/bin/wast-catalog.rs tools/src/bin/wat2wasm.rs tools/Cargo.toml
 	mkdir -p $(BUILD)
 	$(CARGO_TIMEOUT) env CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo build --release --manifest-path $(TOOLS_MANIFEST)
 
@@ -64,9 +64,13 @@ spec-catalog: $(SPEC_OUT)/catalog.jsonl
 spec-suite: $(SPEC_OUT)/catalog.jsonl $(BUILD)/test_suite
 	$(TIMEOUT) $(BUILD)/test_suite $(SPEC_OUT)/catalog.jsonl $(SPEC_OUT)
 
-prep: $(ORACLE)
+prep: $(ORACLE) build/import_host.wasm
 	mkdir -p $(GEN)
 	$(TIMEOUT) $(WASTPREP) tests/fibonacci.wast $(GEN)
+
+build/import_host.wasm: tests/import_host.wat $(RUSTLIB)
+	mkdir -p build
+	$(CARGO_TIMEOUT) env CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo run --release --manifest-path $(TOOLS_MANIFEST) --bin wat2wasm tests/import_host.wat build/import_host.wasm
 
 $(BUILD)/cuwasm-run: src/main_cpu.cpp $(CPU_SRCS) $(RUSTLIB)
 	mkdir -p $(BUILD)
