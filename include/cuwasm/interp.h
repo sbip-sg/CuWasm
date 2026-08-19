@@ -352,6 +352,28 @@ HD void run_instance(const DevModule m, VmState& st, StackV stack, FrameV frames
             globals[in.b] = CU_POP();
             break;
 
+        case OP_UNWIND: {
+            uint32_t nkeep = in.a;
+            uint32_t dest = fp + in.b;
+            if (nkeep > sp)
+                TRAP(ST_TRAP_STACK_OVERFLOW);
+            if (dest < nkeep || dest > STACK_CAP)
+                TRAP(ST_TRAP_STACK_OVERFLOW);
+            uint32_t src = sp - nkeep;
+            uint32_t dst = dest - nkeep;
+            if (dst != src) {
+                if (dst <= src) {
+                    for (uint32_t i = 0; i < nkeep; ++i)
+                        stack.at(dst + i) = stack.at(src + i);
+                } else {
+                    for (int i = (int)nkeep - 1; i >= 0; --i)
+                        stack.at(dst + (uint32_t)i) = stack.at(src + (uint32_t)i);
+                }
+            }
+            sp = dest;
+            break;
+        }
+
         case OP_BR:
             if (in.b <= pc) {
                 if ((fuel -= FUEL_BACKEDGE) <= 0)

@@ -70,6 +70,7 @@ enum CuOpcode : uint16_t {
     OP_I64_EXTEND_I32_U,
     OP_GLOBAL_GET,
     OP_GLOBAL_SET,
+    OP_UNWIND,
 };
 
 struct alignas(8) CuOp {
@@ -157,6 +158,7 @@ inline const char* opcode_name(uint16_t op) {
     case OP_I64_EXTEND_I32_U: return "i64.extend_i32_u";
     case OP_GLOBAL_GET: return "global.get";
     case OP_GLOBAL_SET: return "global.set";
+    case OP_UNWIND: return "unwind";
     default: return "???";
     }
 }

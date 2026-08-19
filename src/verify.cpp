@@ -148,6 +148,15 @@ bool verify_cuop(HostModule& m, std::string& err) {
                     return fail(err, "select underflow");
                 next_h = h - 2;
                 break;
+            case OP_UNWIND: {
+                int dest_h = (int)in.b - (int)f.n_params - (int)f.n_locals;
+                if (dest_h < 0)
+                    return fail(err, "unwind dest below locals");
+                if (h < dest_h)
+                    return fail(err, "unwind underflow");
+                next_h = dest_h;
+                break;
+            }
             case OP_BR: {
                 if (in.b < f.code_off || in.b >= f.code_off + f.code_len)
                     return fail(err, "br target outside function");

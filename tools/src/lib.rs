@@ -4,7 +4,7 @@ use libc::c_char;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
-use wasmparser::{CompositeInnerType, ExternalKind, Operator, Parser, Payload, ValType};
+use wasmparser::{BlockType, CompositeInnerType, ExternalKind, Operator, Parser, Payload, ValType};
 
 pub const OP_UNREACHABLE: u16 = 0;
 pub const OP_I64_CONST: u16 = 1;
@@ -71,6 +71,7 @@ pub const OP_I64_EXTEND_I32_S: u16 = 61;
 pub const OP_I64_EXTEND_I32_U: u16 = 62;
 pub const OP_GLOBAL_GET: u16 = 63;
 pub const OP_GLOBAL_SET: u16 = 64;
+pub const OP_UNWIND: u16 = 65;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +151,10 @@ struct Ctrl {
     else_br: Option<u32>,
     patches: Vec<u32>,
     has_else: bool,
+    base: i32,
+    n_params: u16,
+    n_results: u16,
+    dead_on_entry: bool,
 }
 
 fn intern(consts: &mut Vec<u64>, v: u64) -> u32 {
@@ -187,6 +192,110 @@ fn resolve_br(ctrl: &[Ctrl], depth: u32) -> Result<usize, String> {
     Ok(i)
 }
 
+fn consume(h: &mut i32, dead: bool, pops: i32, pushes: i32) -> Result<(), String> {
+    if dead {
+        return Ok(());
+    }
+    if *h < pops {
+        return Err("operand stack underflow".into());
+    }
+    *h = *h - pops + pushes;
+    Ok(())
+}
+
+fn block_arity(
+    ty: BlockType,
+    func_types: &[(Vec<ValType>, Vec<ValType>)],
+) -> Result<(u16, u16), String> {
+    match ty {
+        BlockType::Empty => Ok((0, 0)),
+        BlockType::Type(t) => {
+            if t != ValType::I32 && t != ValType::I64 {
+                return Err(format!("unsupported block valtype {:?}", t));
+            }
+            Ok((0, 1))
+        }
+        BlockType::FuncType(idx) => {
+            let i = idx as usize;
+            if i >= func_types.len() {
+                return Err("block type index oob".into());
+            }
+            Ok((func_types[i].0.len() as u16, func_types[i].1.len() as u16))
+        }
+    }
+}
+
+fn func_arity(
+    function_index: u32,
+    func_types: &[(Vec<ValType>, Vec<ValType>)],
+    func_typeidx: &[u32],
+) -> Result<(u16, u16), String> {
+    let i = function_index as usize;
+    if i >= func_typeidx.len() {
+        return Err("call function index oob".into());
+    }
+    let t = func_typeidx[i] as usize;
+    if t >= func_types.len() {
+        return Err("call type index oob".into());
+    }
+    Ok((func_types[t].0.len() as u16, func_types[t].1.len() as u16))
+}
+
+fn label_arity(c: &Ctrl) -> i32 {
+    if c.kind == CtrlKind::Loop {
+        c.n_params as i32
+    } else {
+        c.n_results as i32
+    }
+}
+
+fn emit_unwind(
+    code: &mut Vec<CuOpC>,
+    h: i32,
+    c: &Ctrl,
+    fn_params: u16,
+    fn_locals: u16,
+) -> Result<i32, String> {
+    let dest_h = c.base + label_arity(c);
+    if h < dest_h {
+        return Err("branch stack underflow".into());
+    }
+    if h > dest_h {
+        let n_keep = label_arity(c) as u16;
+        let dest_rel = fn_params as u32 + fn_locals as u32 + dest_h as u32;
+        emit(code, OP_UNWIND, n_keep, dest_rel);
+    }
+    Ok(dest_h)
+}
+
+fn push_ctrl(
+    ctrl: &mut Vec<Ctrl>,
+    kind: CtrlKind,
+    start: u32,
+    np: u16,
+    nr: u16,
+    h: i32,
+    dead: bool,
+) -> Result<(), String> {
+    if !dead && h < np as i32 {
+        return Err("block params underflow".into());
+    }
+    let base = if dead { 0 } else { h - np as i32 };
+    ctrl.push(Ctrl {
+        kind,
+        start,
+        br_if_not: None,
+        else_br: None,
+        patches: Vec::new(),
+        has_else: false,
+        base,
+        n_params: np,
+        n_results: nr,
+        dead_on_entry: dead,
+    });
+    Ok(())
+}
+
 fn lower_operators(
     ops: Vec<Operator<'_>>,
     n_params: u16,
@@ -194,8 +303,12 @@ fn lower_operators(
     n_locals: u16,
     code: &mut Vec<CuOpC>,
     consts: &mut Vec<u64>,
+    func_types: &[(Vec<ValType>, Vec<ValType>)],
+    func_typeidx: &[u32],
 ) -> Result<FuncMetaC, String> {
     let code_off = code.len() as u32;
+    let mut h: i32 = 0;
+    let mut dead = false;
     let mut ctrl: Vec<Ctrl> = vec![Ctrl {
         kind: CtrlKind::Func,
         start: code_off,
@@ -203,6 +316,10 @@ fn lower_operators(
         else_br: None,
         patches: Vec::new(),
         has_else: false,
+        base: 0,
+        n_params: 0,
+        n_results,
+        dead_on_entry: false,
     }];
 
     for op in ops {
@@ -210,173 +327,229 @@ fn lower_operators(
             Operator::Nop => {}
             Operator::Unreachable => {
                 emit(code, OP_UNREACHABLE, 0, 0);
+                dead = true;
             }
             Operator::I64Const { value } => {
                 let idx = intern(consts, value as u64);
                 emit(code, OP_I64_CONST, 0, idx);
+                consume(&mut h, dead, 0, 1)?;
             }
             Operator::I32Const { value } => {
                 let idx = intern(consts, value as u32 as u64);
                 emit(code, OP_I64_CONST, 0, idx);
+                consume(&mut h, dead, 0, 1)?;
             }
             Operator::Drop => {
                 emit(code, OP_DROP, 0, 0);
+                consume(&mut h, dead, 1, 0)?;
             }
             Operator::Select => {
                 emit(code, OP_SELECT, 0, 0);
+                consume(&mut h, dead, 3, 1)?;
             }
             Operator::TypedSelect { .. } => {
                 emit(code, OP_SELECT, 0, 0);
+                consume(&mut h, dead, 3, 1)?;
             }
             Operator::I32Eqz => {
                 emit(code, OP_I32_EQZ, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
             }
             Operator::I32Eq => {
                 emit(code, OP_I32_EQ, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Ne => {
                 emit(code, OP_I32_NE, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32LtS => {
                 emit(code, OP_I32_LT_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32LtU => {
                 emit(code, OP_I32_LT_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32LeS => {
                 emit(code, OP_I32_LE_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32LeU => {
                 emit(code, OP_I32_LE_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32GtS => {
                 emit(code, OP_I32_GT_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32GtU => {
                 emit(code, OP_I32_GT_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32GeS => {
                 emit(code, OP_I32_GE_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32GeU => {
                 emit(code, OP_I32_GE_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Add => {
                 emit(code, OP_I32_ADD, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Sub => {
                 emit(code, OP_I32_SUB, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Mul => {
                 emit(code, OP_I32_MUL, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32And => {
                 emit(code, OP_I32_AND, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Or => {
                 emit(code, OP_I32_OR, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Xor => {
                 emit(code, OP_I32_XOR, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32DivS => {
                 emit(code, OP_I32_DIV_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32DivU => {
                 emit(code, OP_I32_DIV_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32RemS => {
                 emit(code, OP_I32_REM_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32RemU => {
                 emit(code, OP_I32_REM_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32Shl => {
                 emit(code, OP_I32_SHL, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32ShrS => {
                 emit(code, OP_I32_SHR_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32ShrU => {
                 emit(code, OP_I32_SHR_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I32WrapI64 => {
                 emit(code, OP_I32_WRAP_I64, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
             }
             Operator::I64Ne => {
                 emit(code, OP_I64_NE, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64LtU => {
                 emit(code, OP_I64_LT_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64LeU => {
                 emit(code, OP_I64_LE_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64GtS => {
                 emit(code, OP_I64_GT_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64GtU => {
                 emit(code, OP_I64_GT_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64GeS => {
                 emit(code, OP_I64_GE_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64GeU => {
                 emit(code, OP_I64_GE_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Mul => {
                 emit(code, OP_I64_MUL, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64And => {
                 emit(code, OP_I64_AND, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Or => {
                 emit(code, OP_I64_OR, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Xor => {
                 emit(code, OP_I64_XOR, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64DivS => {
                 emit(code, OP_I64_DIV_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64DivU => {
                 emit(code, OP_I64_DIV_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64RemS => {
                 emit(code, OP_I64_REM_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64RemU => {
                 emit(code, OP_I64_REM_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Shl => {
                 emit(code, OP_I64_SHL, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64ShrS => {
                 emit(code, OP_I64_SHR_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64ShrU => {
                 emit(code, OP_I64_SHR_U, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Extend32S => {
                 emit(code, OP_I64_EXTEND_I32_S, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
             }
             Operator::I64ExtendI32S => {
                 emit(code, OP_I64_EXTEND_I32_S, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
             }
             Operator::I64ExtendI32U => {
                 emit(code, OP_I64_EXTEND_I32_U, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
             }
             Operator::GlobalGet { global_index } => {
                 emit(code, OP_GLOBAL_GET, 0, global_index);
+                consume(&mut h, dead, 0, 1)?;
             }
             Operator::GlobalSet { global_index } => {
                 emit(code, OP_GLOBAL_SET, 0, global_index);
+                consume(&mut h, dead, 1, 0)?;
             }
             Operator::LocalGet { local_index } => {
                 emit(code, OP_LOCAL_GET, local_index as u16, 0);
+                consume(&mut h, dead, 0, 1)?;
             }
             Operator::LocalSet { local_index } => {
                 emit(code, OP_LOCAL_SET, local_index as u16, 0);
+                consume(&mut h, dead, 1, 0)?;
             }
             Operator::LocalTee { local_index } => {
                 emit(code, OP_LOCAL_SET, local_index as u16, 0);
@@ -384,65 +557,89 @@ fn lower_operators(
             }
             Operator::I64Add => {
                 emit(code, OP_I64_ADD, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Sub => {
                 emit(code, OP_I64_SUB, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Eq => {
                 emit(code, OP_I64_EQ, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64Eqz => {
                 emit(code, OP_I64_EQZ, 0, 0);
+                consume(&mut h, dead, 1, 1)?;
             }
             Operator::I64LeS => {
                 emit(code, OP_I64_LE_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
             Operator::I64LtS => {
                 emit(code, OP_I64_LT_S, 0, 0);
+                consume(&mut h, dead, 2, 1)?;
             }
-            Operator::Block { blockty: _ } => {
-                ctrl.push(Ctrl {
-                    kind: CtrlKind::Block,
-                    start: code.len() as u32,
-                    br_if_not: None,
-                    else_br: None,
-                    patches: Vec::new(),
-                    has_else: false,
-                });
+            Operator::Block { blockty } => {
+                let (np, nr) = block_arity(blockty, func_types)?;
+                push_ctrl(
+                    &mut ctrl,
+                    CtrlKind::Block,
+                    code.len() as u32,
+                    np,
+                    nr,
+                    h,
+                    dead,
+                )?;
             }
-            Operator::Loop { blockty: _ } => {
-                ctrl.push(Ctrl {
-                    kind: CtrlKind::Loop,
-                    start: code.len() as u32,
-                    br_if_not: None,
-                    else_br: None,
-                    patches: Vec::new(),
-                    has_else: false,
-                });
+            Operator::Loop { blockty } => {
+                let (np, nr) = block_arity(blockty, func_types)?;
+                push_ctrl(
+                    &mut ctrl,
+                    CtrlKind::Loop,
+                    code.len() as u32,
+                    np,
+                    nr,
+                    h,
+                    dead,
+                )?;
             }
-            Operator::If { blockty: _ } => {
+            Operator::If { blockty } => {
+                let (np, nr) = block_arity(blockty, func_types)?;
+                consume(&mut h, dead, 1, 0)?;
                 let pc = emit(code, OP_BR_IF_NOT, 0, 0);
-                ctrl.push(Ctrl {
-                    kind: CtrlKind::If,
-                    start: code.len() as u32,
-                    br_if_not: Some(pc),
-                    else_br: None,
-                    patches: Vec::new(),
-                    has_else: false,
-                });
+                push_ctrl(
+                    &mut ctrl,
+                    CtrlKind::If,
+                    code.len() as u32,
+                    np,
+                    nr,
+                    h,
+                    dead,
+                )?;
+                if let Some(c) = ctrl.last_mut() {
+                    c.br_if_not = Some(pc);
+                }
             }
             Operator::Else => {
-                let c = ctrl.last_mut().ok_or("else without if")?;
-                if c.kind != CtrlKind::If {
-                    return Err("else not in if".into());
-                }
+                let (base, np, br_if_not) = {
+                    let c = ctrl.last_mut().ok_or("else without if")?;
+                    if c.kind != CtrlKind::If {
+                        return Err("else not in if".into());
+                    }
+                    (c.base, c.n_params, c.br_if_not)
+                };
                 let br = emit(code, OP_BR, 0, 0);
-                c.else_br = Some(br);
-                c.has_else = true;
-                if let Some(if_pc) = c.br_if_not {
+                {
+                    let c = ctrl.last_mut().unwrap();
+                    c.else_br = Some(br);
+                    c.has_else = true;
+                }
+                if let Some(if_pc) = br_if_not {
                     let dest = code.len() as u32;
                     patch_b(code, if_pc, dest);
                 }
+                h = base + np as i32;
+                dead = false;
             }
             Operator::End => {
                 let c = ctrl.pop().ok_or("unmatched end")?;
@@ -463,9 +660,14 @@ fn lower_operators(
                 for p in c.patches {
                     patch_b(code, p, join_pc);
                 }
+                h = c.base + c.n_results as i32;
+                dead = c.dead_on_entry;
             }
             Operator::Br { relative_depth } => {
                 let idx = resolve_br(&ctrl, relative_depth)?;
+                if !dead {
+                    emit_unwind(code, h, &ctrl[idx], n_params, n_locals)?;
+                }
                 let kind = ctrl[idx].kind;
                 if kind == CtrlKind::Loop {
                     let start = ctrl[idx].start;
@@ -474,11 +676,16 @@ fn lower_operators(
                     let pc = emit(code, OP_BR, 0, 0);
                     ctrl[idx].patches.push(pc);
                 }
+                dead = true;
             }
             Operator::BrIf { relative_depth } => {
-                // jump if != 0. Encode as: br_if_not skip; br target; skip:
+                consume(&mut h, dead, 1, 0)?;
                 let skip_placeholder = emit(code, OP_BR_IF_NOT, 0, 0);
                 let idx = resolve_br(&ctrl, relative_depth)?;
+                let saved_h = h;
+                if !dead {
+                    emit_unwind(code, h, &ctrl[idx], n_params, n_locals)?;
+                }
                 let kind = ctrl[idx].kind;
                 if kind == CtrlKind::Loop {
                     let start = ctrl[idx].start;
@@ -487,17 +694,22 @@ fn lower_operators(
                     let pc = emit(code, OP_BR, 0, 0);
                     ctrl[idx].patches.push(pc);
                 }
+                h = saved_h;
                 let dest = code.len() as u32;
                 patch_b(code, skip_placeholder, dest);
             }
             Operator::Return => {
                 emit(code, OP_RETURN, n_results, 0);
+                dead = true;
             }
             Operator::Call { function_index } => {
                 emit(code, OP_CALL, 0, function_index);
+                let (np, nr) = func_arity(function_index, func_types, func_typeidx)?;
+                consume(&mut h, dead, np as i32, nr as i32)?;
             }
             Operator::ReturnCall { function_index } => {
                 emit(code, OP_RETURN_CALL, 0, function_index);
+                dead = true;
             }
             other => {
                 return Err(format!("unsupported wasm opcode: {:?}", other));
@@ -633,6 +845,8 @@ pub fn translate_wasm(bytes: &[u8]) -> Result<HostModule, String> {
                     n_locals as u16,
                     &mut code,
                     &mut consts,
+                    &func_types,
+                    &func_typeidx,
                 )?;
                 funcs.push(meta);
             }
