@@ -16,8 +16,15 @@ mod tests {
 
     const HELLO_WASM: &[u8] =
         include_bytes!("../../../contracts/wasm/soroban_hello_world_contract.wasm");
+    const INCREMENT_WASM: &[u8] =
+        include_bytes!("../../../contracts/wasm/soroban_increment_contract.wasm");
 
-    fn run_cuwasm(host: &Host, wasm: &[u8], export: &str, arg: Val) -> Result<Val, soroban_env_host::HostError> {
+    fn run_cuwasm(
+        host: &Host,
+        wasm: &[u8],
+        export: &str,
+        args: &[Val],
+    ) -> Result<Val, soroban_env_host::HostError> {
         let mut err = [0u8; 256];
         let module = unsafe { cuwasm_module_load(wasm.as_ptr(), wasm.len(), err.as_mut_ptr(), err.len()) };
         assert!(!module.is_null(), "translate: {}", String::from_utf8_lossy(&err));
@@ -33,8 +40,11 @@ mod tests {
             mem_size,
             relative_objects: Vec::new(),
         };
-        let relative_arg = ctx.to_relative(arg).expect("to_relative arg");
-        let args = [relative_arg.get_payload()];
+        let mut rel_args = Vec::with_capacity(args.len());
+        for &arg in args {
+            rel_args.push(ctx.to_relative(arg).expect("to_relative arg"));
+        }
+        let payloads: Vec<u64> = rel_args.iter().map(|v| v.get_payload()).collect();
         let mut out = CuwasmRunResult {
             status: 0,
             results: [0; 8],
@@ -45,8 +55,12 @@ mod tests {
             cuwasm_module_run(
                 module,
                 fi as u32,
-                args.as_ptr(),
-                1,
+                if payloads.is_empty() {
+                    std::ptr::null()
+                } else {
+                    payloads.as_ptr()
+                },
+                payloads.len() as u32,
                 10_000_000,
                 host_dispatch,
                 &mut ctx as *mut DispatchCtx as *mut std::os::raw::c_void,
@@ -54,10 +68,25 @@ mod tests {
             )
         };
         unsafe { cuwasm_module_free(module) };
-        assert_eq!(rc, 0, "cuwasm run status={} err={}", out.status, String::from_utf8_lossy(&out.error));
+        assert_eq!(
+            rc, 0,
+            "cuwasm run status={} err={}",
+            out.status,
+            String::from_utf8_lossy(&out.error)
+        );
+        if out.n_results == 0 {
+            return Ok(().into());
+        }
         assert_eq!(out.n_results, 1);
         let got_relative = Val::from_payload(out.results[0]);
         Ok(ctx.to_absolute(got_relative).expect("to_absolute result"))
+    }
+
+    fn contract_hash(host: &Host, id: soroban_env_common::AddressObject) -> soroban_env_common::xdr::Hash {
+        match host.scaddress_from_address(id).expect("scaddress") {
+            ScAddress::Contract(h) => h,
+            _ => panic!("expected contract address"),
+        }
     }
 
     #[test]
@@ -74,16 +103,51 @@ mod tests {
 
         let cuwasm_arg: Val = host.string_new_from_slice(b"World")?.into();
 
-        let ScAddress::Contract(contract_hash) = host.scaddress_from_address(hello_id)? else {
-            panic!("expected contract address");
-        };
         let got = host.with_test_contract_frame(
-            contract_hash,
+            contract_hash(&host, hello_id),
             Symbol::try_from_small_str("hello")?,
-            || run_cuwasm(&host, HELLO_WASM, "hello", cuwasm_arg),
+            || run_cuwasm(&host, HELLO_WASM, "hello", &[cuwasm_arg]),
         )?;
 
         assert_eq!(host.compare(&reference, &got)?, Ordering::Equal);
+        Ok(())
+    }
+
+    #[test]
+    fn test_increment() -> Result<(), soroban_env_host::HostError> {
+        let host = Host::test_host_with_recording_footprint();
+        host.set_test_ledger_info_with_current_test_protocol();
+        let id = host.register_test_contract_wasm(INCREMENT_WASM);
+
+        let reference = host.call(
+            id,
+            Symbol::try_from_small_str("increment")?,
+            host.vec_new_from_slice(&[])?,
+        )?;
+        let reference2 = host.call(
+            id,
+            Symbol::try_from_small_str("increment")?,
+            host.vec_new_from_slice(&[])?,
+        )?;
+
+        let host2 = Host::test_host_with_recording_footprint();
+        host2.set_test_ledger_info_with_current_test_protocol();
+        let id2 = host2.register_test_contract_wasm(INCREMENT_WASM);
+        let hash2 = contract_hash(&host2, id2);
+
+        let got = host2.with_test_contract_frame(
+            hash2.clone(),
+            Symbol::try_from_small_str("increment")?,
+            || run_cuwasm(&host2, INCREMENT_WASM, "increment", &[]),
+        )?;
+        let got2 = host2.with_test_contract_frame(
+            hash2,
+            Symbol::try_from_small_str("increment")?,
+            || run_cuwasm(&host2, INCREMENT_WASM, "increment", &[]),
+        )?;
+
+        assert_eq!(host.compare(&reference, &got)?, Ordering::Equal);
+        assert_eq!(host.compare(&reference2, &got2)?, Ordering::Equal);
         Ok(())
     }
 }

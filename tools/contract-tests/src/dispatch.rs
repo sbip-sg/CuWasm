@@ -1,6 +1,6 @@
 use crate::capi::CuwasmMailbox;
 use crate::env_ids;
-use soroban_env_common::{EnvBase, Object, Tag, Val};
+use soroban_env_common::{Env, EnvBase, Object, StorageType, Tag, U32Val, Val};
 use soroban_env_host::Host;
 use std::os::raw::{c_int, c_void};
 
@@ -97,36 +97,107 @@ impl DispatchCtx {
         Ok(((body & !MINOR_MASK) >> MINOR_BITS) as u32)
     }
 
+    fn decode_val(&self, raw: u64) -> Result<Val, String> {
+        self.to_absolute(Val::from_payload(raw))
+    }
+
+    fn decode_storage_type(raw: u64) -> Result<StorageType, String> {
+        match raw {
+            0 => Ok(StorageType::Temporary),
+            1 => Ok(StorageType::Persistent),
+            2 => Ok(StorageType::Instance),
+            _ => Err(format!("bad StorageType {raw}")),
+        }
+    }
+
+    fn finish(&mut self, mb: &mut CuwasmMailbox, res: Option<Val>) -> Result<(), String> {
+        match res {
+            None => {
+                // Soroban wasm imports always have an i64 result slot, even for Void.
+                mb.n_results = 1;
+                let void_val: Val = ().into();
+                mb.results[0] = void_val.get_payload();
+            }
+            Some(v) => {
+                let out = if Object::try_from(v).is_ok() {
+                    self.to_relative(v)?
+                } else {
+                    v
+                };
+                mb.n_results = 1;
+                mb.results[0] = out.get_payload();
+            }
+        }
+        Ok(())
+    }
+
     pub fn dispatch(&mut self, mb: &mut CuwasmMailbox) -> Result<(), String> {
         let name = env_ids::name(mb.fn_id).unwrap_or("?");
-        let res: Val = match name {
+        let res: Option<Val> = match name {
             "string_new_from_linear_memory" => {
                 let pos = Self::decode_u32(mb.args[0])?;
                 let len = Self::decode_u32(mb.args[1])?;
                 let bytes = self.read_bytes(pos, len)?;
-                self.host
-                    .string_new_from_slice(&bytes)
-                    .map_err(|e| format!("string_new_from_slice: {e:?}"))?
-                    .into()
+                Some(
+                    self.host
+                        .string_new_from_slice(&bytes)
+                        .map_err(|e| format!("string_new_from_slice: {e:?}"))?
+                        .into(),
+                )
             }
             "vec_new_from_linear_memory" => {
                 let pos = Self::decode_u32(mb.args[0])?;
                 let len = Self::decode_u32(mb.args[1])?;
                 let vals = self.read_vals(pos, len)?;
+                Some(
+                    self.host
+                        .vec_new_from_slice(&vals)
+                        .map_err(|e| format!("vec_new_from_slice: {e:?}"))?
+                        .into(),
+                )
+            }
+            "has_contract_data" => {
+                let k = self.decode_val(mb.args[0])?;
+                let t = Self::decode_storage_type(mb.args[1])?;
+                Some(
+                    self.host
+                        .has_contract_data(k, t)
+                        .map_err(|e| format!("has_contract_data: {e:?}"))?
+                        .into(),
+                )
+            }
+            "get_contract_data" => {
+                let k = self.decode_val(mb.args[0])?;
+                let t = Self::decode_storage_type(mb.args[1])?;
+                Some(
+                    self.host
+                        .get_contract_data(k, t)
+                        .map_err(|e| format!("get_contract_data: {e:?}"))?,
+                )
+            }
+            "put_contract_data" => {
+                let k = self.decode_val(mb.args[0])?;
+                let v = self.decode_val(mb.args[1])?;
+                let t = Self::decode_storage_type(mb.args[2])?;
                 self.host
-                    .vec_new_from_slice(&vals)
-                    .map_err(|e| format!("vec_new_from_slice: {e:?}"))?
-                    .into()
+                    .put_contract_data(k, v, t)
+                    .map_err(|e| format!("put_contract_data: {e:?}"))?;
+                None
+            }
+            "extend_current_contract_instance_and_code_ttl" => {
+                let threshold: U32Val = Self::decode_u32(mb.args[0])?.into();
+                let extend_to: U32Val = Self::decode_u32(mb.args[1])?.into();
+                self.host
+                    .extend_current_contract_instance_and_code_ttl(threshold, extend_to)
+                    .map_err(|e| format!("extend_current_contract_instance_and_code_ttl: {e:?}"))?;
+                None
             }
             other => {
                 let key = env_ids::import_key(mb.fn_id).unwrap_or("?");
                 return Err(format!("unimplemented host function {key} ({other})"));
             }
         };
-        let rel = self.to_relative(res)?;
-        mb.n_results = 1;
-        mb.results[0] = rel.get_payload();
-        Ok(())
+        self.finish(mb, res)
     }
 }
 
