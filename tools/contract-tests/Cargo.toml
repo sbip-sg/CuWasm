@@ -8,6 +8,10 @@ publish = false
 name = "emit-profiles"
 path = "src/bin/emit-profiles.rs"
 
+[[bin]]
+name = "trace-token"
+path = "src/bin/trace-token.rs"
+
 [dependencies]
 soroban-env-host = { version = "=22.1.3", features = ["testutils"] }
 soroban-env-common = "=22.1.3"

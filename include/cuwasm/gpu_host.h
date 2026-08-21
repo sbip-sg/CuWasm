@@ -13,7 +13,8 @@
  *   Inline: Void=2, False=0, True=1
  *
  * Object heap: each thread owns GpuObjHeap (up to GPU_OBJ_CAP objects).
- * Ledger K/V: each thread owns GpuStorage (up to GPU_STORAGE_CAP entries).
+ * Ledger K/V: two parallel arrays (`keys[]`, `values[]`). Lookup is a linear
+ * scan with byte-by-byte compare — guest handles are never used as key identity.
  */
 
 #include "hd.h"
@@ -43,9 +44,11 @@ static constexpr uint64_t SOROBAN_TRUE   = 1ULL;
 static constexpr uint64_t SOROBAN_FALSE  = 0ULL;
 static constexpr uint64_t SOROBAN_VOID   = 2ULL;
 
-// Construct a raw Val from a handle index and tag
+// Construct a raw Val from a handle index and tag.
+// soroban-env-common v22: Object = from_major_minor_and_tag(handle, 0, tag)
+//   = (handle << 32) | tag
 HD static uint64_t soroban_make_obj(uint32_t handle, uint8_t tag) {
-    return ((uint64_t)handle << 8) | (uint64_t)tag;
+    return ((uint64_t)handle << 32) | (uint64_t)tag;
 }
 
 // Extract the tag byte from a raw Val
@@ -53,9 +56,13 @@ HD static uint8_t soroban_tag(uint64_t raw) {
     return (uint8_t)(raw & 0xFF);
 }
 
-// Extract the handle index from an object Val
+// Extract the object handle (major) from an object Val
 HD static uint32_t soroban_handle(uint64_t raw) {
-    return (uint32_t)(raw >> 8);
+    return (uint32_t)(raw >> 32);
+}
+
+HD static uint64_t soroban_i128_small(uint64_t n) {
+    return (n << 8) | (uint64_t)SOROBAN_TAG_I128SMALL;
 }
 
 // ── fn_id constants (enumeration order in docs/soroban-env.json) ──────────────
@@ -78,22 +85,23 @@ static constexpr uint32_t FN_SYM_NEW_LM         = 138;
 static constexpr uint32_t FN_REQUIRE_AUTH       = 182;
 
 // ── Object heap ───────────────────────────────────────────────────────────────
-static constexpr uint32_t GPU_OBJ_CAP    = 32;  // max live objects per thread
-static constexpr uint32_t GPU_OBJ_BYTES  = 16;  // bytes of inline object data
+static constexpr uint32_t GPU_OBJ_CAP     = 32;
+static constexpr uint32_t GPU_OBJ_BYTES   = 32;  // AddressObject pubkey is 32 B
+static constexpr uint32_t GPU_VEC_ELEMS   = 4;
 
 struct GpuObjEntry {
-    uint8_t  tag;        // SOROBAN_TAG_* value
+    uint8_t  tag;
     uint8_t  _pad[3];
-    uint32_t len;        // for strings/vecs: element count or byte length
-    uint8_t  data[GPU_OBJ_BYTES]; // inline data (e.g., i128 hi/lo)
+    uint32_t len;                    // string/address byte length, or vec arity
+    uint8_t  data[GPU_OBJ_BYTES];    // pubkey / i128 / string prefix
+    uint64_t elems[GPU_VEC_ELEMS];   // raw Vals for VecObject
 };
 
 struct GpuObjHeap {
     GpuObjEntry entries[GPU_OBJ_CAP];
-    uint32_t    count;  // number of allocated objects
+    uint32_t    count;
 };
 
-// Allocate a new object in the heap; returns the raw Val or 0 on OOM.
 HD static uint64_t obj_alloc(GpuObjHeap& heap, uint8_t tag,
                               uint32_t len = 0,
                               const uint8_t* data = nullptr) {
@@ -101,6 +109,8 @@ HD static uint64_t obj_alloc(GpuObjHeap& heap, uint8_t tag,
     uint32_t h = heap.count++;
     auto& e = heap.entries[h];
     e.tag = tag; e.len = len;
+    for (uint32_t i = 0; i < GPU_OBJ_BYTES; ++i) e.data[i] = 0;
+    for (uint32_t i = 0; i < GPU_VEC_ELEMS; ++i) e.elems[i] = 0;
     if (data) {
         uint32_t n = len < GPU_OBJ_BYTES ? len : GPU_OBJ_BYTES;
         for (uint32_t i = 0; i < n; ++i) e.data[i] = data[i];
@@ -108,27 +118,160 @@ HD static uint64_t obj_alloc(GpuObjHeap& heap, uint8_t tag,
     return soroban_make_obj(h, tag);
 }
 
-// Retrieve an entry by raw Val (returns nullptr if invalid)
 HD static GpuObjEntry* obj_get(GpuObjHeap& heap, uint64_t raw) {
     uint32_t h = soroban_handle(raw);
     if (h >= heap.count) return nullptr;
     return &heap.entries[h];
 }
 
-// ── Ledger K/V storage ────────────────────────────────────────────────────────
+// ── Ledger K/V: two parallel arrays, linear scan, byte-wise compare ───────────
+//
+// Keys are canonical byte blobs (not guest handles). Guest VecObject handles
+// change every call; the ScVal XDR / resolved contents do not.
+//   byte[0]     = StorageType (0=temp, 1=persistent, 2=instance)
+//   remaining   = resolved key payload:
+//     SymbolSmall / other small Val : 8-byte little-endian payload
+//     VecObject                     : concat of each element:
+//         AddressObject → 32-byte pubkey from the object heap
+//         other         → 8-byte Val
+// Values are raw Val payloads (8 bytes) for the token/increment workloads.
 static constexpr uint32_t GPU_STORAGE_CAP = 16;
-
-struct GpuStorageEntry {
-    uint64_t key;       // raw Val (opaque 64-bit key)
-    uint64_t val;       // raw Val stored
-    uint8_t  occupied;
-    uint8_t  _pad[7];
-};
+static constexpr uint32_t GPU_KV_KEY_MAX  = 128;
+static constexpr uint32_t GPU_KV_VAL_MAX  = 32;
 
 struct GpuStorage {
-    GpuStorageEntry entries[GPU_STORAGE_CAP];
+    uint8_t  keys[GPU_STORAGE_CAP][GPU_KV_KEY_MAX];
+    uint32_t key_lens[GPU_STORAGE_CAP];
+    uint8_t  values[GPU_STORAGE_CAP][GPU_KV_VAL_MAX];
+    uint32_t val_lens[GPU_STORAGE_CAP];
     uint32_t count;
 };
+
+HD static bool kv_bytes_eq(const uint8_t* a, const uint8_t* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+
+HD static int kv_find(const GpuStorage& store, const uint8_t* key, uint32_t klen) {
+    for (uint32_t i = 0; i < store.count; ++i) {
+        if (store.key_lens[i] != klen) continue;
+        if (kv_bytes_eq(store.keys[i], key, klen)) return (int)i;
+    }
+    return -1;
+}
+
+HD static void kv_write_u64(uint8_t* dst, uint64_t v) {
+    for (int i = 0; i < 8; ++i) dst[i] = (uint8_t)(v >> (8 * i));
+}
+
+HD static uint64_t kv_read_u64(const uint8_t* src) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= ((uint64_t)src[i]) << (8 * i);
+    return v;
+}
+
+// Build a canonical key blob from a guest Val + storage type.
+HD static bool kv_canon_key(GpuObjHeap& heap, uint64_t key_val, uint8_t stype,
+                             uint8_t* out, uint32_t* out_len) {
+    if (GPU_KV_KEY_MAX < 9) return false;
+    uint32_t n = 0;
+    out[n++] = stype;
+    uint8_t tag = soroban_tag(key_val);
+    if (tag == SOROBAN_TAG_VEC_OBJECT) {
+        GpuObjEntry* e = obj_get(heap, key_val);
+        if (!e) return false;
+        uint32_t ne = e->len < GPU_VEC_ELEMS ? e->len : GPU_VEC_ELEMS;
+        for (uint32_t i = 0; i < ne; ++i) {
+            uint64_t ev = e->elems[i];
+            if (soroban_tag(ev) == SOROBAN_TAG_ADDRESS_OBJECT) {
+                GpuObjEntry* a = obj_get(heap, ev);
+                if (n + 32 > GPU_KV_KEY_MAX) return false;
+                if (a) {
+                    for (uint32_t b = 0; b < 32; ++b) out[n++] = a->data[b];
+                } else {
+                    for (uint32_t b = 0; b < 32; ++b) out[n++] = 0;
+                }
+            } else {
+                if (n + 8 > GPU_KV_KEY_MAX) return false;
+                kv_write_u64(out + n, ev);
+                n += 8;
+            }
+        }
+    } else if (tag == SOROBAN_TAG_ADDRESS_OBJECT) {
+        GpuObjEntry* a = obj_get(heap, key_val);
+        if (n + 32 > GPU_KV_KEY_MAX) return false;
+        if (a) {
+            for (uint32_t b = 0; b < 32; ++b) out[n++] = a->data[b];
+        } else {
+            for (uint32_t b = 0; b < 32; ++b) out[n++] = 0;
+        }
+    } else {
+        if (n + 8 > GPU_KV_KEY_MAX) return false;
+        kv_write_u64(out + n, key_val);
+        n += 8;
+    }
+    *out_len = n;
+    return true;
+}
+
+// Token WASM symbol-small constants (from the compiled contract, stable).
+static constexpr uint64_t SYM_ADMIN   = 0xca72bb30eULL;
+static constexpr uint64_t SYM_BALANCE = 0xd9b19b3a2a0eULL;
+static constexpr uint8_t  STOR_TEMPORARY  = 0;
+static constexpr uint8_t  STOR_PERSISTENT = 1;
+static constexpr uint8_t  STOR_INSTANCE   = 2;
+
+HD static void gpu_kv_put_raw(GpuStorage& store,
+                               const uint8_t* key, uint32_t klen,
+                               const uint8_t* val, uint32_t vlen) {
+    int idx = kv_find(store, key, klen);
+    if (idx < 0) {
+        if (store.count >= GPU_STORAGE_CAP) return;
+        idx = (int)store.count++;
+        for (uint32_t b = 0; b < klen && b < GPU_KV_KEY_MAX; ++b)
+            store.keys[idx][b] = key[b];
+        store.key_lens[idx] = klen;
+    }
+    uint32_t n = vlen < GPU_KV_VAL_MAX ? vlen : GPU_KV_VAL_MAX;
+    for (uint32_t b = 0; b < n; ++b)
+        store.values[idx][b] = val[b];
+    store.val_lens[idx] = n;
+}
+
+HD static void gpu_kv_put_u64(GpuStorage& store,
+                               const uint8_t* key, uint32_t klen, uint64_t val) {
+    uint8_t buf[8];
+    kv_write_u64(buf, val);
+    gpu_kv_put_raw(store, key, klen, buf, 8);
+}
+
+// Seed Vec([Admin]) instance → 32-byte admin pubkey.
+HD static void gpu_seed_admin(GpuStorage& store, const uint8_t admin_pk[32]) {
+    uint8_t key[9];
+    key[0] = STOR_INSTANCE;
+    kv_write_u64(key + 1, SYM_ADMIN);
+    gpu_kv_put_raw(store, key, 9, admin_pk, 32);
+}
+
+// Seed Vec([Balance, addr]) persistent → I128Small(amount).
+HD static void gpu_seed_balance(GpuStorage& store, const uint8_t addr_pk[32], uint64_t amount) {
+    uint8_t key[1 + 8 + 32];
+    key[0] = STOR_PERSISTENT;
+    kv_write_u64(key + 1, SYM_BALANCE);
+    for (uint32_t b = 0; b < 32; ++b) key[9 + b] = addr_pk[b];
+    gpu_kv_put_u64(store, key, 41, soroban_i128_small(amount));
+}
+
+HD static void gpu_heap_reset(GpuObjHeap& heap) {
+    heap.count = 0;
+    for (uint32_t i = 0; i < GPU_OBJ_CAP; ++i) {
+        auto& e = heap.entries[i];
+        e.tag = 0; e.len = 0;
+        for (uint32_t b = 0; b < GPU_OBJ_BYTES; ++b) e.data[b] = 0;
+        for (uint32_t k = 0; k < GPU_VEC_ELEMS; ++k) e.elems[k] = 0;
+    }
+}
 
 // ── Combined per-thread GPU host state ────────────────────────────────────────
 struct GpuHostState {
@@ -176,15 +319,23 @@ HD bool gpu_host_dispatch(GpuHostState& state,
     case FN_VEC_NEW_LM: {
         uint32_t ptr = (uint32_t)(mb.args[0] >> 32);
         uint32_t n   = (uint32_t)(mb.args[1] >> 32);
-        // Store first 2 element payloads inline (enough for most uses)
-        uint8_t inline_data[GPU_OBJ_BYTES] = {};
-        if (mem && ptr + n * 8 <= mem_size) {
-            uint32_t bytes = (n * 8 < GPU_OBJ_BYTES) ? n * 8 : GPU_OBJ_BYTES;
-            for (uint32_t i = 0; i < bytes; ++i)
-                inline_data[i] = mem[ptr + i];
+        uint64_t raw = obj_alloc(heap, SOROBAN_TAG_VEC_OBJECT, n, nullptr);
+        GpuObjEntry* e = obj_get(heap, raw);
+        if (e && mem) {
+            uint32_t ne = n < GPU_VEC_ELEMS ? n : GPU_VEC_ELEMS;
+            e->len = n;
+            for (uint32_t i = 0; i < ne; ++i) {
+                uint32_t off = ptr + i * 8;
+                if ((uint64_t)off + 8 <= mem_size) {
+                    uint64_t v = 0;
+                    for (int b = 0; b < 8; ++b)
+                        v |= ((uint64_t)mem[off + b]) << (8 * b);
+                    e->elems[i] = v;
+                }
+            }
         }
         mb.n_results = 1;
-        mb.results[0] = obj_alloc(heap, SOROBAN_TAG_VEC_OBJECT, n, inline_data);
+        mb.results[0] = raw;
         return true;
     }
 
@@ -233,35 +384,64 @@ HD bool gpu_host_dispatch(GpuHostState& state,
         return true;
     }
 
-    // ── Ledger storage ────────────────────────────────────────────────────
+    // ── Ledger storage (byte-wise key compare over two arrays) ────────────
     case FN_HAS_CONTRACT_DATA: {
-        uint64_t key = mb.args[0];
-        for (uint32_t i = 0; i < storage.count; ++i)
-            if (storage.entries[i].occupied && storage.entries[i].key == key) {
-                mb.n_results = 1; mb.results[0] = SOROBAN_TRUE; return true;
-            }
-        mb.n_results = 1; mb.results[0] = SOROBAN_FALSE; return true;
+        uint8_t keybuf[GPU_KV_KEY_MAX];
+        uint32_t klen = 0;
+        uint8_t stype = (uint8_t)mb.args[1];
+        mb.n_results = 1;
+        if (!kv_canon_key(heap, mb.args[0], stype, keybuf, &klen)) {
+            mb.results[0] = SOROBAN_FALSE;
+            return true;
+        }
+        mb.results[0] = (kv_find(storage, keybuf, klen) >= 0)
+                            ? SOROBAN_TRUE : SOROBAN_FALSE;
+        return true;
     }
     case FN_GET_CONTRACT_DATA: {
-        uint64_t key = mb.args[0];
-        for (uint32_t i = 0; i < storage.count; ++i)
-            if (storage.entries[i].occupied && storage.entries[i].key == key) {
-                mb.n_results = 1; mb.results[0] = storage.entries[i].val; return true;
-            }
-        mb.n_results = 1; mb.results[0] = SOROBAN_VOID; return true;
+        uint8_t keybuf[GPU_KV_KEY_MAX];
+        uint32_t klen = 0;
+        uint8_t stype = (uint8_t)mb.args[1];
+        mb.n_results = 1;
+        int idx = -1;
+        if (kv_canon_key(heap, mb.args[0], stype, keybuf, &klen))
+            idx = kv_find(storage, keybuf, klen);
+        if (idx < 0) {
+            mb.results[0] = SOROBAN_VOID;
+            return true;
+        }
+        if (storage.val_lens[idx] == 32) {
+            mb.results[0] = obj_alloc(heap, SOROBAN_TAG_ADDRESS_OBJECT, 32,
+                                      storage.values[idx]);
+            return true;
+        }
+        if (storage.val_lens[idx] >= 8) {
+            mb.results[0] = kv_read_u64(storage.values[idx]);
+            return true;
+        }
+        mb.results[0] = SOROBAN_VOID;
+        return true;
     }
     case FN_PUT_CONTRACT_DATA: {
-        uint64_t key = mb.args[0], val = mb.args[1];
-        for (uint32_t i = 0; i < storage.count; ++i)
-            if (storage.entries[i].occupied && storage.entries[i].key == key) {
-                storage.entries[i].val = val;
-                mb.n_results = 1; mb.results[0] = SOROBAN_VOID; return true;
+        uint8_t keybuf[GPU_KV_KEY_MAX];
+        uint32_t klen = 0;
+        uint8_t stype = (uint8_t)mb.args[2];
+        mb.n_results = 1;
+        mb.results[0] = SOROBAN_VOID;
+        if (!kv_canon_key(heap, mb.args[0], stype, keybuf, &klen))
+            return true;
+        uint64_t v = mb.args[1];
+        if (soroban_tag(v) == SOROBAN_TAG_ADDRESS_OBJECT) {
+            GpuObjEntry* a = obj_get(heap, v);
+            uint8_t pk[32] = {};
+            if (a) {
+                for (uint32_t b = 0; b < 32; ++b) pk[b] = a->data[b];
             }
-        if (storage.count < GPU_STORAGE_CAP) {
-            auto& e = storage.entries[storage.count++];
-            e.key = key; e.val = val; e.occupied = 1;
+            gpu_kv_put_raw(storage, keybuf, klen, pk, 32);
+        } else {
+            gpu_kv_put_u64(storage, keybuf, klen, v);
         }
-        mb.n_results = 1; mb.results[0] = SOROBAN_VOID; return true;
+        return true;
     }
 
     // ── TTL extensions: no-op ─────────────────────────────────────────────

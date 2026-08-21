@@ -14,6 +14,7 @@
 #include "cuwasm/host.h"
 #include "cuwasm/interp.h"
 #include "cuwasm/gpu_host.h"
+#include "cuwasm/gpu_host_run.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -46,9 +47,11 @@ __global__ void k_batch(
     uint8_t*         data_lives,  // [n_threads * n_data]
     uint32_t         n_data,
     GpuHostState*    host_states, // [n_threads] — object heap + ledger storage
-    uint64_t         max_steps)
+    uint64_t         max_steps,
+    uint32_t         n_threads)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_threads) return;
 
     VmState&  st       = states[tid];
     uint64_t* th_stack = stacks     + (uint64_t)tid * BENCH_STACK_CAP;
@@ -99,12 +102,8 @@ static bool cuda_check(cudaError_t e, const char* what) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: bench <module.wasm> <export> [n_threads] [block_size] [args...]\n"
-            "             [--store key=val ...] [--obj tag:lo64:hi64 ...]\n"
-            "  args: hex i64 values passed to the export\n"
-            "  --store: pre-seed per-thread K/V storage with key=val (both hex)\n"
-            "  --obj: pre-allocate an object in the GPU heap (tag,lo,hi all hex)\n"
-            "         allocates handles 0,1,2... in order given\n");
+            "usage: bench <module.wasm> <export> [n_threads=%d] [block_size=%d] [i64args...]\n",
+            8192, 256);
         return 2;
     }
     const char* wasm_path = argv[1];
@@ -113,47 +112,20 @@ int main(int argc, char** argv) {
     int block_size  = argc > 4 ? std::atoi(argv[4]) : 256;
     int n_blocks    = (n_threads + block_size - 1) / block_size;
 
-    // Parse args, --store k=v, and --obj tag:lo:hi
     std::vector<uint64_t> call_args;
-    // Storage pre-seeds
-    struct StoreSeed { uint64_t key, val; };
-    std::vector<StoreSeed> store_seeds;
-    // Object heap pre-seeds
-    struct ObjSeed { uint8_t tag; uint64_t lo, hi; };
-    std::vector<ObjSeed> obj_seeds;
+    for (int i = 5; i < argc; ++i)
+        call_args.push_back((uint64_t)std::strtoll(argv[i], nullptr, 16));
 
-    for (int i = 5; i < argc; ++i) {
-        const char* a = argv[i];
-        if (std::strcmp(a, "--store") == 0) {
-            ++i;
-            while (i < argc && argv[i][0] != '-') {
-                uint64_t k = 0, v = 0;
-                const char* eq = std::strchr(argv[i], '=');
-                if (eq) {
-                    k = (uint64_t)std::strtoull(argv[i], nullptr, 16);
-                    v = (uint64_t)std::strtoull(eq + 1, nullptr, 16);
-                }
-                store_seeds.push_back({k, v});
-                ++i;
-            }
-            --i;
-        } else if (std::strcmp(a, "--obj") == 0) {
-            ++i;
-            while (i < argc && argv[i][0] != '-') {
-                // format: tag:lo:hi (all hex)
-                uint64_t tag = 0, lo = 0, hi = 0;
-                char* end;
-                tag = std::strtoull(argv[i], &end, 16);
-                if (*end == ':') { lo = std::strtoull(end+1, &end, 16); }
-                if (*end == ':') { hi = std::strtoull(end+1, nullptr, 16); }
-                obj_seeds.push_back({(uint8_t)tag, lo, hi});
-                ++i;
-            }
-            --i;
-        } else {
-            call_args.push_back((uint64_t)std::strtoull(a, nullptr, 16));
-        }
-    }
+    const bool is_token_scenario = std::strcmp(exp_name, "token_scenario") == 0;
+    const bool is_token_mint     = std::strcmp(exp_name, "mint") == 0;
+    const bool is_token_xfer     = std::strcmp(exp_name, "transfer") == 0;
+    const bool is_token_bal      = std::strcmp(exp_name, "balance") == 0;
+    const bool is_hello          = std::strcmp(exp_name, "hello") == 0;
+
+    uint8_t pk_alice[32], pk_bob[32], pk_admin[32];
+    cuwasm::fill_pk(pk_alice, 0xA1);
+    cuwasm::fill_pk(pk_bob,   0xB0);
+    cuwasm::fill_pk(pk_admin, 0xAD);
 
     std::string err;
     std::vector<uint8_t> wasm_bytes;
@@ -167,39 +139,42 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "translate/verify: %s\n", err.c_str());
         return 1;
     }
-    int fi = hm.find_export(exp_name);
+    const char* timed_export = is_token_scenario ? "transfer" : exp_name;
+    int fi = hm.find_export(timed_export);
     if (fi < 0) {
-        std::fprintf(stderr, "export not found: %s\n", exp_name);
+        std::fprintf(stderr, "export not found: %s\n", timed_export);
         return 1;
     }
     const cuwasm::FuncMeta& func = hm.funcs[(uint32_t)fi];
+    int fi_mint = hm.find_export("mint");
+    int fi_xfer = hm.find_export("transfer");
 
     // ── GPU setup ────────────────────────────────────────────────────────
     uint32_t n_globals = (uint32_t)hm.globals.size();
     uint32_t mem_max   = hm.mem_size;  // actually-used bytes
     uint32_t n_data    = (uint32_t)hm.data_live.size();
 
-    // Pad call_args to match function signature
+    // Pad / auto-fill call args to match the timed export signature
     std::vector<uint64_t> padded_args(func.n_params, 0);
-    for (size_t i = 0; i < call_args.size() && i < padded_args.size(); ++i)
-        padded_args[i] = call_args[i];
-
-    cuwasm::VmState st0{};
-    st0.pc       = func.code_off;
-    st0.sp       = func.n_params + func.n_locals;
-    st0.fp       = 0;
-    st0.csp      = 1;
-    st0.fuel     = (int64_t)cuwasm::BENCH_MAX_STEPS;
-    st0.status   = cuwasm::ST_RUNNING;
-    st0.peak_csp = 1;
-    st0.mem_size = mem_max;
-
-    std::vector<uint64_t> h_stack_tmpl(cuwasm::BENCH_STACK_CAP, 0);
-    for (size_t i = 0; i < padded_args.size() && i < cuwasm::BENCH_STACK_CAP; ++i)
-        h_stack_tmpl[i] = padded_args[i];
-
-    std::vector<cuwasm::Frame> h_frame_tmpl(cuwasm::BENCH_FRAME_CAP);
-    h_frame_tmpl[0] = cuwasm::Frame{0, 0, 0, func.n_results};
+    if (is_token_xfer || is_token_scenario) {
+        padded_args = {
+            cuwasm::soroban_make_obj(0, cuwasm::SOROBAN_TAG_ADDRESS_OBJECT),
+            cuwasm::soroban_make_obj(1, cuwasm::SOROBAN_TAG_ADDRESS_OBJECT),
+            cuwasm::soroban_make_obj(2, cuwasm::SOROBAN_TAG_I128OBJECT),
+        };
+    } else if (is_token_mint) {
+        padded_args = {
+            cuwasm::soroban_make_obj(0, cuwasm::SOROBAN_TAG_ADDRESS_OBJECT),
+            cuwasm::soroban_make_obj(1, cuwasm::SOROBAN_TAG_I128OBJECT),
+        };
+    } else if (is_token_bal) {
+        padded_args = { cuwasm::soroban_make_obj(0, cuwasm::SOROBAN_TAG_ADDRESS_OBJECT) };
+    } else if (is_hello) {
+        padded_args = { cuwasm::soroban_make_obj(0, cuwasm::SOROBAN_TAG_STRING_OBJECT) };
+    } else {
+        for (size_t i = 0; i < call_args.size() && i < padded_args.size(); ++i)
+            padded_args[i] = call_args[i];
+    }
 
     // ── Device allocations ───────────────────────────────────────────────
     cuwasm::CuOp*     d_code   = nullptr;
@@ -245,8 +220,8 @@ int main(int argc, char** argv) {
                  n_threads, total_bytes / (1024*1024));
     std::fprintf(stderr, "  per-thread: stack=%zuB frames=%zuB globals=%zuB "
                  "mem=%uB host_state=%zuB\n",
-                 cuwasm::BENCH_STACK_CAP * 8,
-                 cuwasm::BENCH_FRAME_CAP * sizeof(cuwasm::Frame),
+                 (size_t)cuwasm::BENCH_STACK_CAP * 8,
+                 (size_t)cuwasm::BENCH_FRAME_CAP * sizeof(cuwasm::Frame),
                  (size_t)(n_globals ? n_globals : 1u) * 8,
                  mem_max ? mem_max : 1u,
                  sizeof(cuwasm::GpuHostState));
@@ -298,30 +273,36 @@ int main(int argc, char** argv) {
     dm.type_fp  = hm.type_fp.empty() ? nullptr : d_tfp;
     dm.n_types  = (uint32_t)hm.type_fp.size();
 
-    // ── reinit: reset all per-thread mutable state ───────────────────────
-    auto reinit = [&]() {
-        {
-            std::vector<cuwasm::VmState> h_st(n_threads, st0);
-            cudaMemcpy(d_states, h_st.data(), per_states, cudaMemcpyHostToDevice);
+    auto upload_wasm_call = [&](const cuwasm::FuncMeta& f, const std::vector<uint64_t>& args) {
+        cuwasm::VmState st{};
+        st.pc = f.code_off;
+        st.sp = f.n_params + f.n_locals;
+        st.fp = 0; st.csp = 1;
+        st.fuel = (int64_t)cuwasm::BENCH_MAX_STEPS;
+        st.status = cuwasm::ST_RUNNING;
+        st.peak_csp = 1;
+        st.mem_size = mem_max;
+        std::vector<cuwasm::VmState> h_st(n_threads, st);
+        cudaMemcpy(d_states, h_st.data(), per_states, cudaMemcpyHostToDevice);
+
+        std::vector<uint64_t> h_s((size_t)n_threads * cuwasm::BENCH_STACK_CAP, 0);
+        for (int t = 0; t < n_threads; ++t) {
+            uint64_t* slot = &h_s[(size_t)t * cuwasm::BENCH_STACK_CAP];
+            for (size_t i = 0; i < args.size() && i < cuwasm::BENCH_STACK_CAP; ++i)
+                slot[i] = args[i];
         }
-        {
-            std::vector<uint64_t> h_s((size_t)n_threads * cuwasm::BENCH_STACK_CAP, 0);
-            for (int t = 0; t < n_threads; ++t)
-                std::memcpy(&h_s[(size_t)t * cuwasm::BENCH_STACK_CAP],
-                            h_stack_tmpl.data(), cuwasm::BENCH_STACK_CAP * 8);
-            cudaMemcpy(d_stacks, h_s.data(), per_stacks, cudaMemcpyHostToDevice);
-        }
-        {
-            std::vector<cuwasm::Frame> h_f((size_t)n_threads * cuwasm::BENCH_FRAME_CAP);
-            for (int t = 0; t < n_threads; ++t)
-                std::memcpy(&h_f[(size_t)t * cuwasm::BENCH_FRAME_CAP],
-                            h_frame_tmpl.data(), cuwasm::BENCH_FRAME_CAP * sizeof(cuwasm::Frame));
-            cudaMemcpy(d_frames, h_f.data(), per_frames, cudaMemcpyHostToDevice);
-        }
+        cudaMemcpy(d_stacks, h_s.data(), per_stacks, cudaMemcpyHostToDevice);
+
+        std::vector<cuwasm::Frame> h_f((size_t)n_threads * cuwasm::BENCH_FRAME_CAP);
+        cuwasm::Frame fr0{0, 0, 0, f.n_results};
+        for (int t = 0; t < n_threads; ++t)
+            h_f[(size_t)t * cuwasm::BENCH_FRAME_CAP] = fr0;
+        cudaMemcpy(d_frames, h_f.data(), per_frames, cudaMemcpyHostToDevice);
+
         if (n_globals) {
             std::vector<uint64_t> h_g((size_t)n_threads * n_globals);
             for (int t = 0; t < n_threads; ++t)
-                std::memcpy(&h_g[(size_t)t * n_globals], hm.globals.data(), n_globals*8);
+                std::memcpy(&h_g[(size_t)t * n_globals], hm.globals.data(), n_globals * 8);
             cudaMemcpy(d_globals, h_g.data(), per_globs, cudaMemcpyHostToDevice);
         }
         if (mem_max) {
@@ -334,27 +315,44 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> h_l((size_t)n_threads * n_data, 1);
             cudaMemcpy(d_lives, h_l.data(), per_lives, cudaMemcpyHostToDevice);
         }
-        // Zero-init all per-thread host states, then apply pre-seeds
-        cudaMemset(d_host_states, 0, per_hstates);
-        if (!store_seeds.empty() || !obj_seeds.empty()) {
-            // Build a template GpuHostState and upload it to each thread
-            cuwasm::GpuHostState tmpl{};
-            for (auto& s : obj_seeds) {
-                if (tmpl.obj_heap.count >= cuwasm::GPU_OBJ_CAP) break;
-                auto& e = tmpl.obj_heap.entries[tmpl.obj_heap.count++];
-                e.tag = s.tag; e.len = 16;
-                for (int j = 0; j < 8; ++j) e.data[j]   = (uint8_t)(s.lo >> (8*j));
-                for (int j = 0; j < 8; ++j) e.data[8+j] = (uint8_t)(s.hi >> (8*j));
+    };
+
+    enum class SeedMode { None, Hello, Mint, Transfer, Balance };
+
+    auto upload_host = [&](bool reset_kv, SeedMode mode) {
+        std::vector<cuwasm::GpuHostState> h(n_threads);
+        if (!reset_kv)
+            cudaMemcpy(h.data(), d_host_states, per_hstates, cudaMemcpyDeviceToHost);
+        for (int t = 0; t < n_threads; ++t) {
+            if (reset_kv) {
+                std::memset(&h[t], 0, sizeof(cuwasm::GpuHostState));
+                if (mode == SeedMode::Mint || mode == SeedMode::Transfer ||
+                    (is_token_scenario && mode == SeedMode::Mint))
+                    cuwasm::gpu_seed_admin(h[t].storage, pk_admin);
+                if (mode == SeedMode::Transfer || mode == SeedMode::Balance)
+                    cuwasm::gpu_seed_balance(h[t].storage, pk_alice, 1000);
             }
-            for (auto& s : store_seeds) {
-                if (tmpl.storage.count >= cuwasm::GPU_STORAGE_CAP) break;
-                auto& e = tmpl.storage.entries[tmpl.storage.count++];
-                e.key = s.key; e.val = s.val; e.occupied = 1;
+            switch (mode) {
+            case SeedMode::Hello:
+                cuwasm::gpu_heap_reset(h[t].obj_heap);
+                cuwasm::obj_alloc(h[t].obj_heap, cuwasm::SOROBAN_TAG_STRING_OBJECT,
+                                  5, (const uint8_t*)"World");
+                break;
+            case SeedMode::Mint:
+                cuwasm::seed_mint_args(h[t], pk_alice, 1000);
+                break;
+            case SeedMode::Transfer:
+                cuwasm::seed_transfer_args(h[t], pk_alice, pk_bob, 400);
+                break;
+            case SeedMode::Balance:
+                cuwasm::seed_balance_args(h[t], pk_alice);
+                break;
+            case SeedMode::None:
+            default:
+                break;
             }
-            // Upload template to all threads
-            std::vector<cuwasm::GpuHostState> h_hs(n_threads, tmpl);
-            cudaMemcpy(d_host_states, h_hs.data(), per_hstates, cudaMemcpyHostToDevice);
         }
+        cudaMemcpy(d_host_states, h.data(), per_hstates, cudaMemcpyHostToDevice);
     };
 
     auto launch = [&]() {
@@ -364,16 +362,11 @@ int main(int argc, char** argv) {
             d_blob, (uint32_t)hm.data_blob.size(), d_doff, d_dlen,
             d_lives, n_data,
             d_host_states,
-            cuwasm::BENCH_MAX_STEPS);
+            cuwasm::BENCH_MAX_STEPS,
+            (uint32_t)n_threads);
     };
 
-    // ── Warmup run ───────────────────────────────────────────────────────
-    reinit();
-    launch();
-    CU(cudaDeviceSynchronize());
-
-    // Check results and print thread[0] diagnostics
-    {
+    auto count_ok = [&]() -> int {
         std::vector<cuwasm::VmState> h_out(n_threads);
         cudaMemcpy(h_out.data(), d_states, per_states, cudaMemcpyDeviceToHost);
         int ok = 0, pending = 0, unsup = 0, other = 0;
@@ -385,39 +378,87 @@ int main(int argc, char** argv) {
             else if (s == cuwasm::ST_UNSUPPORTED_OP) unsup++;
             else { if (!other) first_fail = s; other++; }
         }
-        std::fprintf(stderr, "warmup: ok=%d pending=%d unsupported=%d other=%d",
+        std::fprintf(stderr, "  ok=%d pending=%d unsupported=%d other=%d",
                      ok, pending, unsup, other);
         if (other) std::fprintf(stderr, " (first=%s)", cuwasm::status_name(first_fail));
         std::fprintf(stderr, "\n");
+        return ok;
+    };
 
-        // Diagnostics for thread[0]
+    auto dump_t0 = [&]() {
         if (func.n_results > 0) {
             uint64_t result0 = 0;
             cudaMemcpy(&result0, d_stacks, sizeof(uint64_t), cudaMemcpyDeviceToHost);
             std::fprintf(stderr, "  thread[0] result = 0x%llx\n", (long long)result0);
         }
-        {
-            cuwasm::GpuHostState h_hstate;
-            cudaMemcpy(&h_hstate, d_host_states, sizeof(cuwasm::GpuHostState), cudaMemcpyDeviceToHost);
-            std::fprintf(stderr, "  thread[0] obj_heap: %u objects, storage: %u entries\n",
-                         h_hstate.obj_heap.count, h_hstate.storage.count);
-            for (uint32_t i = 0; i < h_hstate.storage.count && i < 4; ++i)
-                std::fprintf(stderr, "    storage[%u] key=0x%llx val=0x%llx\n", i,
-                             (long long)h_hstate.storage.entries[i].key,
-                             (long long)h_hstate.storage.entries[i].val);
+        cuwasm::GpuHostState h_hstate;
+        cudaMemcpy(&h_hstate, d_host_states, sizeof(cuwasm::GpuHostState), cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "  thread[0] obj_heap: %u objects, storage: %u entries\n",
+                     h_hstate.obj_heap.count, h_hstate.storage.count);
+        auto bal = [&](const uint8_t* pk) -> uint64_t {
+            uint8_t key[41];
+            key[0] = cuwasm::STOR_PERSISTENT;
+            cuwasm::kv_write_u64(key + 1, cuwasm::SYM_BALANCE);
+            std::memcpy(key + 9, pk, 32);
+            int idx = cuwasm::kv_find(h_hstate.storage, key, 41);
+            if (idx < 0 || h_hstate.storage.val_lens[idx] < 8) return 0;
+            return cuwasm::kv_read_u64(h_hstate.storage.values[idx]);
+        };
+        if (is_token_xfer || is_token_scenario || is_token_mint || is_token_bal) {
+            std::fprintf(stderr, "  thread[0] alice=0x%llx bob=0x%llx\n",
+                         (long long)bal(pk_alice), (long long)bal(pk_bob));
         }
+    };
 
-        if (ok == 0) {
-            std::fprintf(stderr, "ERROR: zero threads succeeded; aborting.\n");
-            std::printf("{\"contract\":\"%s\",\"export\":\"%s\","
-                        "\"n_threads\":%d,\"kernel_ms\":0,\"tps\":0,\"ok\":0}\n",
-                        wasm_path, exp_name, n_threads);
-            return 1;
+    SeedMode timed_mode = SeedMode::None;
+    if (is_hello) timed_mode = SeedMode::Hello;
+    else if (is_token_mint) timed_mode = SeedMode::Mint;
+    else if (is_token_xfer || is_token_scenario) timed_mode = SeedMode::Transfer;
+    else if (is_token_bal) timed_mode = SeedMode::Balance;
+
+    auto setup_timed_call = [&]() {
+        upload_wasm_call(func, padded_args);
+        if (is_token_scenario) {
+            // Mint first (not timed), keep KV, then seed transfer heap.
+            if (fi_mint < 0 || fi_xfer < 0) {
+                std::fprintf(stderr, "token_scenario needs mint+transfer exports\n");
+                std::exit(1);
+            }
+            const auto& fm = hm.funcs[(uint32_t)fi_mint];
+            std::vector<uint64_t> mint_args = {
+                cuwasm::soroban_make_obj(0, cuwasm::SOROBAN_TAG_ADDRESS_OBJECT),
+                cuwasm::soroban_make_obj(1, cuwasm::SOROBAN_TAG_I128OBJECT),
+            };
+            upload_host(true, SeedMode::Mint);
+            upload_wasm_call(fm, mint_args);
+            launch();
+            cudaDeviceSynchronize();
+            std::fprintf(stderr, "scenario mint:");
+            count_ok();
+            upload_host(false, SeedMode::Transfer);
+            upload_wasm_call(func, padded_args);
+        } else {
+            upload_host(true, timed_mode);
         }
+    };
+
+    // ── Warmup ───────────────────────────────────────────────────────────
+    setup_timed_call();
+    launch();
+    CU(cudaDeviceSynchronize());
+    std::fprintf(stderr, "warmup:");
+    int wok = count_ok();
+    dump_t0();
+    if (wok == 0) {
+        std::fprintf(stderr, "ERROR: zero threads succeeded; aborting.\n");
+        std::printf("{\"contract\":\"%s\",\"export\":\"%s\","
+                    "\"n_threads\":%d,\"kernel_ms\":0,\"tps\":0,\"ok\":0}\n",
+                    wasm_path, exp_name, n_threads);
+        return 1;
     }
 
     // ── Timed run ────────────────────────────────────────────────────────
-    reinit();
+    setup_timed_call();
     cudaEvent_t ev0, ev1;
     CU(cudaEventCreate(&ev0));
     CU(cudaEventCreate(&ev1));
@@ -430,13 +471,59 @@ int main(int argc, char** argv) {
     float ms = 0.f;
     CU(cudaEventElapsedTime(&ms, ev0, ev1));
 
-    // Count successes
-    int n_ok = 0;
-    {
-        std::vector<cuwasm::VmState> h_out(n_threads);
-        cudaMemcpy(h_out.data(), d_states, per_states, cudaMemcpyDeviceToHost);
-        for (int i = 0; i < n_threads; ++i)
-            if (h_out[i].status == cuwasm::ST_OK) n_ok++;
+    std::fprintf(stderr, "timed:");
+    int n_ok = count_ok();
+    dump_t0();
+
+    if (n_ok != n_threads) {
+        std::fprintf(stderr, "ERROR: %d/%d threads succeeded\n", n_ok, n_threads);
+        return 1;
+    }
+
+    if (is_token_xfer || is_token_scenario) {
+        cuwasm::GpuHostState t0;
+        cudaMemcpy(&t0, d_host_states, sizeof(t0), cudaMemcpyDeviceToHost);
+        auto bal = [&](const uint8_t* pk) -> uint64_t {
+            uint8_t key[41];
+            key[0] = cuwasm::STOR_PERSISTENT;
+            cuwasm::kv_write_u64(key + 1, cuwasm::SYM_BALANCE);
+            std::memcpy(key + 9, pk, 32);
+            int idx = cuwasm::kv_find(t0.storage, key, 41);
+            if (idx < 0 || t0.storage.val_lens[idx] < 8) return 0;
+            return cuwasm::kv_read_u64(t0.storage.values[idx]);
+        };
+        uint64_t a = bal(pk_alice), b = bal(pk_bob);
+        if (a != cuwasm::soroban_i128_small(600) || b != cuwasm::soroban_i128_small(400)) {
+            std::fprintf(stderr, "ERROR: balances alice=0x%llx bob=0x%llx want 600/400\n",
+                         (long long)a, (long long)b);
+            return 1;
+        }
+        std::fprintf(stderr, "correctness: alice=600 bob=400 OK\n");
+    }
+    if (is_token_mint) {
+        cuwasm::GpuHostState t0;
+        cudaMemcpy(&t0, d_host_states, sizeof(t0), cudaMemcpyDeviceToHost);
+        uint8_t key[41];
+        key[0] = cuwasm::STOR_PERSISTENT;
+        cuwasm::kv_write_u64(key + 1, cuwasm::SYM_BALANCE);
+        std::memcpy(key + 9, pk_alice, 32);
+        int idx = cuwasm::kv_find(t0.storage, key, 41);
+        uint64_t a = (idx >= 0 && t0.storage.val_lens[idx] >= 8)
+                         ? cuwasm::kv_read_u64(t0.storage.values[idx]) : 0;
+        if (a != cuwasm::soroban_i128_small(1000)) {
+            std::fprintf(stderr, "ERROR: mint alice=0x%llx want 1000\n", (long long)a);
+            return 1;
+        }
+        std::fprintf(stderr, "correctness: mint alice=1000 OK\n");
+    }
+    if (is_token_bal) {
+        uint64_t result0 = 0;
+        cudaMemcpy(&result0, d_stacks, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        if (result0 != cuwasm::soroban_i128_small(1000)) {
+            std::fprintf(stderr, "ERROR: balance result=0x%llx want 1000\n", (long long)result0);
+            return 1;
+        }
+        std::fprintf(stderr, "correctness: balance=1000 OK\n");
     }
 
     double tps = (double)n_ok / (ms / 1000.0);

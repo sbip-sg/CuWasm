@@ -3,7 +3,7 @@ mod dispatch;
 mod env_ids;
 
 pub use capi::{CUWASM_CAPI_OP_COUNT, *};
-pub use dispatch::{host_dispatch, DispatchCtx};
+pub use dispatch::{host_dispatch, DispatchCtx, HostCallTrace};
 
 use capi::CuwasmRunProfile;
 use soroban_env_common::Val;
@@ -12,6 +12,7 @@ use std::ffi::CString;
 
 pub struct RunProfileOut {
     pub host_calls: Vec<(String, u16)>,
+    pub traces: Vec<HostCallTrace>,
     pub opcode_counts: [u64; capi::CUWASM_CAPI_OP_COUNT],
     pub unsupported_opcode_counts: [u64; capi::CUWASM_CAPI_OP_COUNT],
     pub total_ops: u64,
@@ -42,6 +43,7 @@ pub fn run_cuwasm_profile(
         mem_size,
         relative_objects: Vec::new(),
         host_calls: Vec::new(),
+        traces: Vec::new(),
     };
     let mut rel_args = Vec::with_capacity(args.len());
     for &arg in args {
@@ -95,6 +97,7 @@ pub fn run_cuwasm_profile(
         got,
         RunProfileOut {
             host_calls: ctx.host_calls,
+            traces: ctx.traces,
             opcode_counts: profile.opcode_counts,
             unsupported_opcode_counts: profile.unsupported_opcode_counts,
             total_ops: profile.total_ops,

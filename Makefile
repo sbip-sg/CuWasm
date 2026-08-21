@@ -14,26 +14,38 @@ ORACLE := $(BUILD)/cuwasm-oracle
 WASTPREP := $(BUILD)/wastprep
 RUST_LIBS := -ldl -lpthread -lm -lgcc_s
 
-.PHONY: test-hello-world test-increment test-token test-contract-tests emit-profiles
+# libcuwasm_translate.a already contains rust_eh_personality; Rust bins need this.
+CONTRACT_RUSTFLAGS := -C link-arg=-Wl,--allow-multiple-definition
+
+.PHONY: test-hello-world test-increment test-token test-contract-tests emit-profiles trace-token
 test-hello-world: $(RUSTLIB)
-	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml test_hello_world -- --nocapture
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests RUSTFLAGS="$(CONTRACT_RUSTFLAGS)" \
+		cargo test --release --manifest-path tools/contract-tests/Cargo.toml --lib test_hello_world -- --nocapture
 
 test-increment: $(RUSTLIB)
-	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml test_increment -- --nocapture
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests RUSTFLAGS="$(CONTRACT_RUSTFLAGS)" \
+		cargo test --release --manifest-path tools/contract-tests/Cargo.toml --lib test_increment -- --nocapture
 
 test-token: $(RUSTLIB)
-	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml test_token -- --nocapture
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests RUSTFLAGS="$(CONTRACT_RUSTFLAGS)" \
+		cargo test --release --manifest-path tools/contract-tests/Cargo.toml --lib test_token -- --nocapture
 
 test-contract-tests: $(RUSTLIB)
-	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo test --release --manifest-path tools/contract-tests/Cargo.toml -- --nocapture
+	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests RUSTFLAGS="$(CONTRACT_RUSTFLAGS)" \
+		cargo test --release --manifest-path tools/contract-tests/Cargo.toml --lib -- --nocapture
 
 emit-profiles: $(RUSTLIB)
 	$(TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests cargo run --release --manifest-path tools/contract-tests/Cargo.toml --bin emit-profiles
 
+.PHONY: trace-token
+trace-token: $(RUSTLIB)
+	$(CARGO_TIMEOUT) env CARGO_TARGET_DIR=$(BUILD)/contract-tests RUSTFLAGS="$(CONTRACT_RUSTFLAGS)" \
+		cargo run --release --manifest-path tools/contract-tests/Cargo.toml --bin trace-token
+
 CPU_SRCS := src/translate.cpp src/verify.cpp src/disasm.cpp src/run.cpp src/capi.cpp
 TEST_SRCS := tests/test_main.cpp $(CPU_SRCS)
 
-.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike spec-suite spec-catalog bench
+.PHONY: all verify test-cpu test-gpu prep tools clean suite test-host-spike spec-suite spec-catalog bench bench-token
 
 all: $(BUILD)/cuwasm-run $(BUILD)/test_cpu
 
@@ -114,8 +126,16 @@ test-cpu: prep $(BUILD)/test_cpu $(BUILD)/cuwasm-run
 test-gpu: prep $(BUILD)/test_gpu
 	$(TIMEOUT) $(BUILD)/test_gpu --t8 --wast tests/fibonacci.wast --gen $(GEN)
 
-verify: test-cpu test-gpu
+verify: test-cpu test-gpu test-gpu-host
 	@echo "verify ok"
+
+$(BUILD)/test_gpu_host: tests/test_gpu_host.cpp $(CPU_SRCS) $(RUSTLIB)
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ tests/test_gpu_host.cpp $(CPU_SRCS) $(RUSTLIB) $(RUST_LIBS)
+
+.PHONY: test-gpu-host
+test-gpu-host: $(BUILD)/test_gpu_host
+	$(TIMEOUT) $(BUILD)/test_gpu_host
 
 HOST_SPIKE := tools/host-spike/Cargo.toml
 test-host-spike:
@@ -132,6 +152,16 @@ bench: $(BUILD)/bench
 	@echo "=== increment scaling sweep ==="
 	@for n in 256 1024 4096 8192 16384; do \
 	  $(BUILD)/bench $(INCREMENT_WASM) increment $$n $(BENCH_BS); \
+	done
+
+.PHONY: bench-token
+bench-token: $(BUILD)/bench
+	@echo "=== token mint / transfer / balance / scenario ==="
+	@for n in 1024 4096 8192; do \
+	  $(BUILD)/bench $(TOKEN_WASM) balance $$n $(BENCH_BS); \
+	  $(BUILD)/bench $(TOKEN_WASM) mint $$n $(BENCH_BS); \
+	  $(BUILD)/bench $(TOKEN_WASM) transfer $$n $(BENCH_BS); \
+	  $(BUILD)/bench $(TOKEN_WASM) token_scenario $$n $(BENCH_BS); \
 	done
 
 clean:
